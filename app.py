@@ -101,18 +101,21 @@ class ScrapeDoSession:
         return self._request("POST", url, headers=headers, data=data, timeout=timeout)
 
     def _request(self, method, url, headers=None, data=None, timeout=30):
+        # Construir parámetros para scrape.do
         params = {
             "token": self.token,
-            "url": url,
+            "url": url,  # Asegurar que la URL completa se pasa
             "method": method.upper(),
             "country": "co",
             "render_js": "false",
             "timeout": str(timeout * 1000),  # milisegundos
         }
-        if headers:
-            params["headers"] = json.dumps(headers)
-        if data:
-            params["data"] = json.dumps(data) if isinstance(data, dict) else data
+        # Siempre enviar headers y data como JSON (aunque estén vacíos)
+        params["headers"] = json.dumps(headers or {})
+        params["data"] = json.dumps(data or {})
+
+        # Log para depuración (opcional, puedes imprimir en consola)
+        print(f"🔍 Petición a scrape.do: {SCRAPE_DO_URL} con params: {params}")
 
         resp = requests.get(SCRAPE_DO_URL, params=params, timeout=timeout + 10)
         resp.raise_for_status()
