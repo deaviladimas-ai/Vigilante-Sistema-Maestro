@@ -758,6 +758,58 @@ def _dividir_mensaje(mensaje, limite):
 
     return partes if partes else [mensaje[:limite]]
 
+# ========== COMANDO 'actualizar' DESDE TELEGRAM ==========
+
+def _procesar_comando_actualizar():
+    """
+    Corre en un hilo aparte (para no bloquear la respuesta al webhook de
+    Telegram, que exige contestar rápido). Ejecuta el vigilante y siempre
+    manda un mensaje de vuelta con el resultado, aunque no haya cambios.
+    """
+    try:
+        resultado = ejecutar_vigilante(notificar_siempre=False)
+        enviar_telegram(f"🔧 <b>Actualizar:</b> {html.escape(resultado)}")
+    except Exception as e:
+        enviar_telegram(f"⚠️ Error ejecutando 'actualizar': {html.escape(str(e)[:200])}")
+
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    """
+    Endpoint que Telegram llama cada vez que hay un mensaje nuevo en el chat
+    del bot (una vez configurado con setWebhook, ver instrucciones abajo).
+    Si el mensaje es 'actualizar' y viene del chat autorizado
+    (TELEGRAM_CHAT_ID), dispara ejecutar_vigilante(notificar_siempre=False)
+    en segundo plano y responde por Telegram con el resultado.
+    """
+    update = request.get_json(silent=True) or {}
+    mensaje = update.get("message") or update.get("edited_message") or {}
+
+    chat_id = str(mensaje.get("chat", {}).get("id", ""))
+    texto = (mensaje.get("text") or "").strip().lower()
+
+    # Solo reaccionar al chat autorizado; ignorar todo lo demás en silencio
+    if chat_id == str(TELEGRAM_CHAT_ID) and texto in ("actualizar", "/actualizar"):
+        threading.Thread(target=_procesar_comando_actualizar, daemon=True).start()
+
+    # Siempre responder 200 rápido, o Telegram reintenta el webhook
+    return {"ok": True}, 200
+
+@app.route("/set-webhook")
+def set_webhook():
+    """
+    Endpoint de conveniencia: registra la URL pública de este servicio como
+    webhook de Telegram, para no tener que llamar la API a mano con curl.
+    Visítala UNA VEZ desde el navegador después de desplegar
+    (ej: https://tu-app.onrender.com/set-webhook).
+    """
+    url_publica = request.host_url.rstrip("/") + "/telegram-webhook"
+    url_api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    try:
+        r = requests.post(url_api, data={"url": url_publica}, timeout=10)
+        return {"webhook_configurado": url_publica, "respuesta_telegram": r.json()}
+    except Exception as e:
+        return {"error": str(e)}, 500
+
 # ========== ENDPOINTS DE DIAGNÓSTICO AGREGADOS ==========
 
 @app.route("/check")
