@@ -81,6 +81,19 @@ INTERVALO_ACTUALIZACION_POSTULADOS = int(os.environ.get("INTERVALO_ACTUALIZACION
 # a cargar_datos_anteriores()/guardar_datos_actuales() sin bloquearse a sí mismo.
 lock_json = threading.RLock()
 
+# ========== COMANDO "Actualizar" DESDE TELEGRAM ==========
+# Nombre del bot (para reconocer menciones tipo "@VigilanteSistemaMaestroBot Actualizar").
+# Ajustable por variable de entorno si algún día cambias el nombre del bot.
+TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "VigilanteSistemaMaestroBot")
+
+# Token secreto opcional para verificar que las peticiones al webhook realmente
+# vienen de Telegram (se configura al registrar el webhook, ver instrucciones
+# más abajo). Si no se define, no se valida (no recomendado en producción).
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+
+# Evita que dos "Actualizar" simultáneos disparen dos scrapeos completos a la vez.
+lock_ejecucion_vigilante = threading.Lock()
+
 # ============================================================
 # FUNCIONES ELIMINADAS (comentadas o simplemente no existen)
 # ============================================================
@@ -436,7 +449,7 @@ def limpiar_plazas_vencidas(plazas):
 
 #--------------
 
-def ejecutar_vigilante(notificar_siempre=False):
+def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
     """
     Flujo principal automatizado:
     1. Limpiar plazas vencidas del JSON.
@@ -444,6 +457,10 @@ def ejecutar_vigilante(notificar_siempre=False):
     3. Si faltan plazas, agregar todas las pendientes por departamento.
     4. Detectar cambios (plazas nuevas, postulados que cambiaron).
     5. Notificar por Telegram (si hay cambios o si se fuerza).
+
+    chat_id: si se especifica (por ejemplo, cuando alguien escribe "Actualizar"
+    en el chat), el mensaje de resultado se envía a ESE chat en vez del
+    TELEGRAM_CHAT_ID configurado por defecto.
     """
     try:
         # 1. Cargar JSON actual (base de datos)
@@ -500,17 +517,22 @@ def ejecutar_vigilante(notificar_siempre=False):
                 ids_nuevas,
                 total_mapa_anterior
             )
-            enviar_telegram(resumen)
+            enviar_telegram(resumen, chat_id=chat_id)
             # Guardar total del mapa actual para futuras comparaciones
             guardar_total_mapa_actual(total_mapa)
             return "Notificación enviada."
         else:
+            mensaje_sin_cambios = "✅ Vigilante ejecutado: no hay cambios nuevos respecto a la última revisión."
+            # Si alguien pidió la actualización manualmente (chat_id definido),
+            # igual le confirmamos que se ejecutó, aunque no haya novedades.
+            if chat_id is not None:
+                enviar_telegram(mensaje_sin_cambios, chat_id=chat_id)
             # Actualizar total_mapa.json aunque no haya cambios (para mantener sincronía)
             guardar_total_mapa_actual(total_mapa)
             return "Sin cambios notificables."
 
     except Exception as e:
-        enviar_telegram(f"⚠️ Error en vigilante: {str(e)[:200]}")
+        enviar_telegram(f"⚠️ Error en vigilante: {str(e)[:200]}", chat_id=chat_id)
         return f"Error: {str(e)[:100]}"
 
 def cargar_total_mapa_anterior():
@@ -700,20 +722,24 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
 
     return "\n".join(lineas)
 
-def enviar_telegram(mensaje):
+def enviar_telegram(mensaje, chat_id=None):
     """
     Envía un mensaje a Telegram, dividiéndolo en varias partes si supera
     el límite de 4096 caracteres que impone la API de Telegram, y
     registrando en logs cualquier error HTTP (antes se ignoraba en
     silencio, por eso los mensajes largos "desaparecían" sin avisar).
+
+    chat_id: chat destino. Si no se especifica, se usa el TELEGRAM_CHAT_ID
+    configurado por defecto (comportamiento igual al original).
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     LIMITE = 4000  # margen de seguridad bajo el límite real de Telegram (4096)
+    destino = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
 
     partes = _dividir_mensaje(mensaje, LIMITE)
 
     for i, parte in enumerate(partes, start=1):
-        datos = {"chat_id": TELEGRAM_CHAT_ID, "text": parte, "parse_mode": "HTML"}
+        datos = {"chat_id": destino, "text": parte, "parse_mode": "HTML"}
         try:
             r = requests.post(url, data=datos, timeout=10)
             if r.status_code != 200:
@@ -809,6 +835,96 @@ def set_webhook():
         return {"webhook_configurado": url_publica, "respuesta_telegram": r.json()}
     except Exception as e:
         return {"error": str(e)}, 500
+
+# ========== COMANDO "Actualizar" DESDE TELEGRAM (WEBHOOK) ==========
+# --------------------------------------------------------
+
+def _es_comando_actualizar(texto):
+    """
+    Determina si el texto de un mensaje de Telegram equivale al comando
+    "Actualizar", tolerando:
+      - Mayúsculas/minúsculas ("actualizar", "ACTUALIZAR", "Actualizar")
+      - Mención al bot delante ("@VigilanteSistemaMaestroBot Actualizar")
+      - Forma de comando ("/actualizar", "/actualizar@VigilanteSistemaMaestroBot")
+    """
+    if not texto:
+        return False
+
+    texto = texto.strip()
+
+    # Quitar mención al bot si está al inicio, en cualquier posición del texto
+    mencion = f"@{TELEGRAM_BOT_USERNAME}"
+    texto_sin_mencion = texto.replace(mencion, "").strip()
+
+    candidato = texto_sin_mencion.lower()
+
+    if candidato in ("actualizar", "/actualizar"):
+        return True
+
+    return False
+
+
+def _procesar_comando_actualizar(chat_id):
+    """
+    Se ejecuta en un hilo aparte (para no bloquear la respuesta al webhook
+    de Telegram, que espera un 200 OK rápido). Corre ejecutar_vigilante()
+    forzando notificación y respondiendo al chat que escribió "Actualizar".
+    """
+    adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
+    if not adquirido:
+        enviar_telegram(
+            "⏳ Ya hay una actualización en curso. Te aviso cuando termine esa.",
+            chat_id=chat_id,
+        )
+        return
+
+    try:
+        enviar_telegram("🔎 Actualizando plazas, dame un momento...", chat_id=chat_id)
+        ejecutar_vigilante(notificar_siempre=True, chat_id=chat_id)
+    except Exception as e:
+        enviar_telegram(f"⚠️ Error al actualizar: {str(e)[:200]}", chat_id=chat_id)
+    finally:
+        lock_ejecucion_vigilante.release()
+
+
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    """
+    Endpoint que Telegram llama cada vez que hay un mensaje nuevo en un chat
+    donde está el bot (una vez configurado el webhook, ver instrucciones en
+    el comentario más abajo, cerca de donde arranca la app).
+
+    Si el texto del mensaje es "Actualizar" (con las variantes toleradas en
+    _es_comando_actualizar), dispara ejecutar_vigilante() en un hilo aparte
+    y responde de inmediato 200 OK a Telegram para no generar timeouts.
+    """
+    # Validación opcional del secreto del webhook, si se configuró.
+    if TELEGRAM_WEBHOOK_SECRET:
+        secreto_recibido = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secreto_recibido != TELEGRAM_WEBHOOK_SECRET:
+            return {"ok": False}, 403
+
+    try:
+        update = request.get_json(silent=True) or {}
+    except Exception:
+        update = {}
+
+    mensaje = update.get("message") or update.get("edited_message") or {}
+    texto = mensaje.get("text", "")
+    chat = mensaje.get("chat", {})
+    chat_id = chat.get("id")
+
+    if chat_id is not None and _es_comando_actualizar(texto):
+        threading.Thread(
+            target=_procesar_comando_actualizar,
+            args=(chat_id,),
+            daemon=True,
+        ).start()
+
+    # Siempre respondemos 200 OK rápido, aunque el mensaje no sea el comando.
+    return {"ok": True}, 200
+
+# --------------------------------------------------------
 
 # ========== ENDPOINTS DE DIAGNÓSTICO AGREGADOS ==========
 
@@ -1397,6 +1513,34 @@ def limpiar_vencidas():
 # paralelo. Con Render, usa un solo worker (gunicorn app:app --workers 1)
 # o mueve esta tarea a un Background Worker/Cron Job aparte.
 threading.Thread(target=hilo_actualizador_postulados, daemon=True).start()
+
+# ============================================================
+# CÓMO ACTIVAR EL COMANDO "Actualizar" (WEBHOOK DE TELEGRAM)
+# ============================================================
+# Telegram necesita saber a qué URL avisarte cada vez que alguien escribe en
+# el chat. Esto se configura UNA SOLA VEZ (no en cada arranque de la app),
+# llamando a la API de Telegram desde tu navegador, curl, o Postman:
+#
+#   https://api.telegram.org/bot<TELEGRAM_TOKEN>/setWebhook?url=<TU_URL_PUBLICA>/telegram-webhook
+#
+# Ejemplo real (reemplaza <TOKEN> y <TU_APP> por los tuyos):
+#
+#   https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<TU_APP>.onrender.com/telegram-webhook
+#
+# Opcional pero recomendado (evita que cualquiera golpee tu endpoint):
+# define la variable de entorno TELEGRAM_WEBHOOK_SECRET con un valor
+# aleatorio, y agrégalo también en el setWebhook:
+#
+#   https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<TU_APP>.onrender.com/telegram-webhook&secret_token=<TU_SECRETO>
+#
+# Para verificar que quedó bien configurado:
+#
+#   https://api.telegram.org/bot<TOKEN>/getWebhookInfo
+#
+# Una vez hecho esto, cualquier persona en el chat puede escribir
+# "Actualizar" (o "@VigilanteSistemaMaestroBot Actualizar" en un grupo) y el
+# bot ejecutará ejecutar_vigilante() y responderá en ese mismo chat.
+# ============================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
