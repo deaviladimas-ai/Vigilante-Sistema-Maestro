@@ -92,7 +92,7 @@ class ScrapeDoResponse:
 class ScrapeDoSession:
     def __init__(self, token):
         self.token = token
-        self.headers = {}  # Opcional, para futuras extensiones
+        self.headers = {}
 
     def get(self, url, headers=None, timeout=30, **kwargs):
         return self._request("GET", url, headers=headers, timeout=timeout, data=kwargs.get("data"))
@@ -101,17 +101,20 @@ class ScrapeDoSession:
         return self._request("POST", url, headers=headers, data=data, timeout=timeout)
 
     def _request(self, method, url, headers=None, data=None, timeout=30):
-        payload = {
+        params = {
             "token": self.token,
             "url": url,
             "method": method.upper(),
-            "headers": headers or {},
-            "data": data or {},
-            "country": "co",          # IP de Colombia
-            "render_js": False,       # No necesita JS
-            "timeout": 30000,         # 30 segundos (milisegundos)
+            "country": "co",
+            "render_js": "false",
+            "timeout": str(timeout * 1000),  # milisegundos
         }
-        resp = requests.post(SCRAPE_DO_URL, json=payload, timeout=timeout + 10)
+        if headers:
+            params["headers"] = json.dumps(headers)
+        if data:
+            params["data"] = json.dumps(data) if isinstance(data, dict) else data
+
+        resp = requests.get(SCRAPE_DO_URL, params=params, timeout=timeout + 10)
         resp.raise_for_status()
         result = resp.json()
         return ScrapeDoResponse(result)
