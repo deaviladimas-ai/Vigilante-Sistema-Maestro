@@ -16,7 +16,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 URL_PAGINA = "https://sistemamaestro.mineducacion.gov.co/SistemaMaestro/busquedaVacantes.xhtml"
 ARCHIVO_DATOS = "plazas.json"
-ARCHIVO_TOTAL_MAPA = "total_mapa.json"  # Nuevo archivo para guardar el total del mapa
+ARCHIVO_TOTAL_MAPA = "total_mapa.json"
 ZONA_COLOMBIA = ZoneInfo("America/Bogota")
 
 HEADERS_AJAX = {
@@ -27,10 +27,15 @@ HEADERS_AJAX = {
     "User-Agent": "Mozilla/5.0",
 }
 
+# ========== CONFIGURACIÓN DEL PROXY SCRAPE.DO ==========
+USE_PROXY = os.environ.get("USE_PROXY", "true").lower() == "true"   # Activar por defecto
+SCRAPE_DO_URL = "https://api.scrape.do"
+API_TOKEN = os.environ.get("SCRAPE_DO_TOKEN", "")   # Pon tu token real en Render
+
 # ========== MAPEO DE DEPARTAMENTOS ==========
 DEPARTAMENTOS_CODIGOS = {
-    "amazonas": "91",         #confirmado
-    "antioquia": "05",        #confirmado
+    "amazonas": "91",
+    "antioquia": "05",
     "arauca": "81",
     "atlántico": "08",
     "bogotá": "919",
@@ -51,15 +56,15 @@ DEPARTAMENTOS_CODIGOS = {
     "magdalena": "47",
     "meta": "50",
     "nariño": "52",
-    "norte de santander": "54", #confirmado
+    "norte de santander": "54",
     "putumayo": "86",
-    "quindío": "63",          #confirmado
+    "quindío": "63",
     "risaralda": "66",
     "san andrés": "88",
-    "santander": "68",           #confirmado
+    "santander": "68",
     "sucre": "70",
     "tolima": "73",
-    "valle del cauca": "76",  #confirmado
+    "valle del cauca": "76",
     "vaupés": "97",
     "vichada": "99",
 }
@@ -67,11 +72,60 @@ MAX_PAGINAS = 60
 FILAS_POR_PAGINA = 6
 
 # ============================================================
-# FUNCIONES ELIMINADAS (comentadas o simplemente no existen)
+# CLASES Y FUNCIONES PARA EL PROXY
 # ============================================================
 
-# Carga manual de un JSON externo
-# --------------------------------------------------------
+class ScrapeDoResponse:
+    """Emula una respuesta de requests para que el código existente funcione sin cambios."""
+    def __init__(self, result_json):
+        self.status_code = result_json.get("status", 500)
+        self.text = result_json.get("body", "")
+        self.headers = result_json.get("headers", {})
+        self._json = result_json
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(
+                f"HTTP {self.status_code}: {self.text[:100]}"
+            )
+
+class ScrapeDoSession:
+    def __init__(self, token):
+        self.token = token
+        self.headers = {}  # Opcional, para futuras extensiones
+
+    def get(self, url, headers=None, timeout=30, **kwargs):
+        return self._request("GET", url, headers=headers, timeout=timeout, data=kwargs.get("data"))
+
+    def post(self, url, headers=None, data=None, timeout=30, **kwargs):
+        return self._request("POST", url, headers=headers, data=data, timeout=timeout)
+
+    def _request(self, method, url, headers=None, data=None, timeout=30):
+        payload = {
+            "token": self.token,
+            "url": url,
+            "method": method.upper(),
+            "headers": headers or {},
+            "data": data or {},
+            "country": "co",          # IP de Colombia
+            "render_js": False,       # No necesita JS
+            "timeout": 30000,         # 30 segundos (milisegundos)
+        }
+        resp = requests.post(SCRAPE_DO_URL, json=payload, timeout=timeout + 10)
+        resp.raise_for_status()
+        result = resp.json()
+        return ScrapeDoResponse(result)
+
+def get_session():
+    """Devuelve una sesión (normal o con proxy) según la configuración."""
+    if USE_PROXY:
+        return ScrapeDoSession(API_TOKEN)
+    else:
+        return requests.Session()
+
+# ============================================================
+# FUNCIONES DE PERSISTENCIA Y SCRAPING
+# ============================================================
 
 def cargar_datos_anteriores():
     if os.path.exists(ARCHIVO_DATOS):
@@ -89,9 +143,9 @@ def guardar_datos_actuales(plazas):
     else:
         print("⚠️ Se intentó guardar una lista vacía de plazas. No se sobrescribió el archivo.")
 
-# También necesitamos obtener_total_plazas_mapa y guardar_total_mapa_actual para mantener consistencia
 def obtener_total_plazas_mapa():
-    r = requests.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    session = get_session()   # [PROXY]
+    r = session.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     r.raise_for_status()
     patron = r"alt:\s*'DEP-\d+',\s*title:\s*'([^']+)'"
     coincidencias = re.findall(patron, r.text)
@@ -100,9 +154,6 @@ def obtener_total_plazas_mapa():
 def guardar_total_mapa_actual(total_mapa):
     with open(ARCHIVO_TOTAL_MAPA, "w", encoding="utf-8") as f:
         json.dump({"total_mapa": total_mapa}, f, ensure_ascii=False, indent=2)
-
-#De forma manual desde la interfaz web y automatica
-# --------------------------------------------------------
 
 def obtener_viewstate(session):
     r = session.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
@@ -196,7 +247,7 @@ def cambiar_filtro_departamento(session, viewstate, codigo_departamento):
     """
     data = {
         "javax.faces.partial.ajax": "true",
-        "javax.faces.source": "form-busqueda:idInputDepartamento",  # Cambio aquí
+        "javax.faces.source": "form-busqueda:idInputDepartamento",
         "javax.faces.partial.execute": "@all",
         "javax.faces.partial.render": "accordion",
         "javax.faces.behavior.event": "change",
@@ -204,9 +255,9 @@ def cambiar_filtro_departamento(session, viewstate, codigo_departamento):
         "form-busqueda": "form-busqueda",
         "javax.faces.ViewState": viewstate,
         "form-busqueda:idInputSecretaria_focus": "",
-        "form-busqueda:idInputSecretaria_input": "",          # Vacío
+        "form-busqueda:idInputSecretaria_input": "",
         "form-busqueda:idInputDepartamento_focus": "",
-        "form-busqueda:idInputDepartamento_input": codigo_departamento,  # Nuevo campo
+        "form-busqueda:idInputDepartamento_input": codigo_departamento,
         "form-busqueda:idInputEstablecimiento_filter": "",
         "form-busqueda:idInputArea_focus": "",
         "form-busqueda:idInputArea_input": "",
@@ -239,9 +290,9 @@ def pedir_pagina_filtrada(session, viewstate, first, rows, codigo_departamento):
         "form-busqueda": "form-busqueda",
         "javax.faces.ViewState": viewstate,
         "form-busqueda:idInputSecretaria_focus": "",
-        "form-busqueda:idInputSecretaria_input": "",          # Vacío
+        "form-busqueda:idInputSecretaria_input": "",
         "form-busqueda:idInputDepartamento_focus": "",
-        "form-busqueda:idInputDepartamento_input": codigo_departamento,  # Cambio
+        "form-busqueda:idInputDepartamento_input": codigo_departamento,
         "form-busqueda:idInputEstablecimiento_filter": "",
         "form-busqueda:idInputArea_focus": "",
         "form-busqueda:idInputArea_input": "",
@@ -265,7 +316,6 @@ def obtener_vacantes_por_departamento(nombre_departamento):
     nombre_clean = nombre_departamento.lower().strip()
     codigo = DEPARTAMENTOS_CODIGOS.get(nombre_clean)
     if not codigo:
-        # Búsqueda flexible
         for key, value in DEPARTAMENTOS_CODIGOS.items():
             if nombre_clean in key or key in nombre_clean:
                 codigo = value
@@ -273,15 +323,13 @@ def obtener_vacantes_por_departamento(nombre_departamento):
     if not codigo:
         raise ValueError(f"Departamento '{nombre_departamento}' no encontrado en el mapeo")
 
-    session = requests.Session()
+    session = get_session()   # [PROXY]  <--- Cambio clave aquí
     viewstate = obtener_viewstate(session)
     if not viewstate:
         raise RuntimeError("No se pudo obtener el ViewState inicial")
 
-    # Aplicar filtro de departamento
     _, viewstate = cambiar_filtro_departamento(session, viewstate, codigo)
 
-    # Paginar resultados
     todas = []
     first = 0
     for _ in range(MAX_PAGINAS):
@@ -297,10 +345,9 @@ def obtener_vacantes_por_departamento(nombre_departamento):
     return desambiguar_ids(todas)
 
 def obtener_departamentos_del_mapa():
-    """
-    Extrae los nombres de departamento desde los títulos de los marcadores del mapa.
-    """
-    r = requests.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    """Extrae los nombres de departamento desde los títulos de los marcadores del mapa."""
+    session = get_session()   # [PROXY]
+    r = session.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     r.raise_for_status()
     patron = r"alt:\s*'DEP-\d+',\s*title:\s*'([^']+)'"
     titulos = re.findall(patron, r.text)
@@ -322,15 +369,12 @@ def fusionar_plazas(plazas_bd, plazas_scrapeadas):
     ids_nuevas = set()
     for p in plazas_scrapeadas:
         if p["id"] in bd_por_id:
-            # Actualizar datos de la plaza existente
             bd_por_id[p["id"]].update(p)
         else:
             bd_por_id[p["id"]] = dict(p)
             ids_nuevas.add(p["id"])
     return list(bd_por_id.values()), ids_nuevas
 
-#eliminar plaza
-#--------------
 def parsear_fecha_cierre(cierre_texto):
     """
     Convierte '01/08/2026 a las 11:30' a datetime con zona horaria de Colombia.
@@ -356,8 +400,6 @@ def limpiar_plazas_vencidas(plazas):
             vigentes.append(p)
     return vigentes, vencidas
 
-#--------------
-
 def ejecutar_vigilante(notificar_siempre=False):
     """
     Flujo principal automatizado:
@@ -368,25 +410,20 @@ def ejecutar_vigilante(notificar_siempre=False):
     5. Notificar por Telegram (si hay cambios o si se fuerza).
     """
     try:
-        # 1. Cargar JSON actual (base de datos)
         plazas_bd = cargar_datos_anteriores()
         total_json_actual = len(plazas_bd)
 
-        # Guardar copia ANTES de cualquier modificación (para detectar cambios)
         plazas_antes = plazas_bd.copy()
 
-        # 2. Limpiar plazas vencidas
         plazas_vigentes, plazas_vencidas = limpiar_plazas_vencidas(plazas_bd)
         if plazas_vencidas:
             guardar_datos_actuales(plazas_vigentes)
             plazas_bd = plazas_vigentes
             total_json_actual = len(plazas_bd)
 
-        # 3. Obtener total del mapa actual y el anterior (de total_mapa.json)
         total_mapa = obtener_total_plazas_mapa()
         total_mapa_anterior = cargar_total_mapa_anterior()
 
-        # 4. Si hay plazas faltantes, agregarlas automáticamente
         if total_mapa > total_json_actual:
             departamentos_pendientes = obtener_departamentos_pendientes()
             for depto in departamentos_pendientes:
@@ -396,14 +433,11 @@ def ejecutar_vigilante(notificar_siempre=False):
                     guardar_datos_actuales(plazas_bd)
                 except Exception as e:
                     print(f"Error agregando {depto}: {e}")
-            # Después de agregar, recargar plazas_bd y total_json_actual
             plazas_bd = cargar_datos_anteriores()
             total_json_actual = len(plazas_bd)
 
-        # 5. Detectar cambios comparando plazas_bd con plazas_antes
         cambios = detectar_cambios(plazas_bd, plazas_antes)
 
-        # 6. Determinar si notificar
         hay_cambios = (
             (total_mapa != total_mapa_anterior) or
             cambios["total_nuevas"] > 0 or
@@ -413,21 +447,18 @@ def ejecutar_vigilante(notificar_siempre=False):
         debe_notificar = hay_cambios or notificar_siempre
 
         if debe_notificar:
-            # Extraer IDs de plazas nuevas para el resumen
             ids_nuevas = {p["id"] for p in cambios["nuevas"]}
             resumen = construir_resumen(
                 plazas_bd,
-                plazas_bd,  # plazas_scrapeadas (usamos las mismas, pues ya están actualizadas)
+                plazas_bd,
                 total_mapa,
                 ids_nuevas,
                 total_mapa_anterior
             )
             enviar_telegram(resumen)
-            # Guardar total del mapa actual para futuras comparaciones
             guardar_total_mapa_actual(total_mapa)
             return "Notificación enviada."
         else:
-            # Actualizar total_mapa.json aunque no haya cambios (para mantener sincronía)
             guardar_total_mapa_actual(total_mapa)
             return "Sin cambios notificables."
 
@@ -446,18 +477,12 @@ def cargar_total_mapa_anterior():
             return 0
     return 0
 
-def guardar_total_mapa_actual(total_mapa):
-    with open(ARCHIVO_TOTAL_MAPA, "w", encoding="utf-8") as f:
-        json.dump({"total_mapa": total_mapa}, f, ensure_ascii=False, indent=2)
-
 def obtener_departamentos_pendientes():
     """
     Devuelve una lista con los nombres de los departamentos que tienen
     plazas en el mapa pero no están completas en el JSON.
     """
-    # Obtener departamentos del mapa
     deptos_mapa = obtener_departamentos_del_mapa()
-    # Cargar JSON y contar plazas por departamento
     plazas_json = cargar_datos_anteriores()
     contador_json = defaultdict(int)
     for p in plazas_json:
@@ -465,9 +490,8 @@ def obtener_departamentos_pendientes():
         if depto:
             contador_json[depto] += 1
 
-    # Obtener conteo por departamento desde el mapa
-    # (reutilizamos la lógica de /departamentos)
-    r = requests.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    session = get_session()   # [PROXY]
+    r = session.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     r.raise_for_status()
     patron = r'L\.marker\(\[.*?\],\s*\{[^}]*title:\s*[\'"]([^\'"]+)[\'"][^}]*\}\)'
     coincidencias = re.findall(patron, r.text, re.DOTALL)
@@ -521,7 +545,7 @@ def detectar_cambios(plazas_actuales, plazas_anteriores):
         "total_nuevas": len(nuevas),
         "total_actualizadas": len(actualizadas)
     }
-    
+
 def contar_plazas_por_activacion(plazas):
     """
     Recorre la lista de plazas y cuenta cuántas tienen su fecha de activación
@@ -545,7 +569,7 @@ def contar_plazas_por_activacion(plazas):
                 contador_ayer += 1
 
     return contador_hoy, contador_ayer
-    
+
 def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None, total_mapa_anterior=None):
     """
     Construye el mensaje para Telegram.
@@ -559,7 +583,6 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
 
     total_hoy_json, total_ayer_calculado = contar_plazas_por_activacion(plazas_bd)
 
-    # Agrupar TODAS las plazas del JSON por departamento
     deptos = defaultdict(list)
     for p in plazas_bd:
         deptos[p["departamento"]].append(p)
@@ -567,7 +590,7 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
     lineas = []
     lineas.append("🚨 <b>¡Plazas Sistema Maestro!</b> 🚨")
     lineas.append("")
-    
+
     if total_mapa_anterior is not None:
         diferencia = total_mapa - total_mapa_anterior
         if diferencia > 0:
@@ -578,10 +601,10 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
             lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} ↔️")
     else:
         lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa}")
-    
+
     lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy_json}")
     lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer_calculado}")
-    
+
     lineas.append("")
     lineas.append("--- <b>TODAS LAS PLAZAS</b> ---")
     lineas.append("")
@@ -593,13 +616,13 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
         lineas.append(f"📌 <b>{depto}</b>")
         for p in sorted(deptos[depto], key=lambda x: x["area"]):
             es_nueva = p["id"] in ids_nuevas
-            
+
             cambio = None
             if not es_nueva and p["id"] in anteriores_por_id:
                 anterior = anteriores_por_id[p["id"]]
                 if p["postulados"] != anterior["postulados"]:
                     cambio = (anterior["postulados"], p["postulados"])
-            
+
             if es_nueva:
                 linea = f"  • {p['area']} ({p['municipio']}) 🆕 – {p['postulados']} postulados"
             else:
@@ -610,7 +633,7 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
                     elif cambio[1] < cambio[0]:
                         flecha = " ↓"
                 linea = f"  • {p['area']} ({p['municipio']}){flecha} – {p['postulados']} postulados"
-            
+
             lineas.append(linea)
         lineas.append("")
 
@@ -627,7 +650,7 @@ def enviar_telegram(mensaje):
     except Exception as e:
         print(f"Error Telegram: {e}")
 
-# ========== ENDPOINTS DE DIAGNÓSTICO AGREGADOS ==========
+# ========== ENDPOINTS ==========
 
 @app.route("/check")
 def check():
@@ -822,9 +845,7 @@ def home():
                     } else {
                         resultadoDiv.innerHTML = `✅ ${data.mensaje} (Total en JSON: ${data.total_plazas_en_json})`;
                         alert(`✅ ${data.mensaje}\\nEncontradas: ${data.plazas_encontradas}\\nNuevas agregadas: ${data.plazas_nuevas}`);
-                        // Refrescar la tabla de departamentos
                         verDepartamentos();
-                        // Refrescar el contenido del JSON en el <pre>
                         actualizarContenidoJSON();
                     }
                 })
@@ -869,7 +890,6 @@ def home():
                 const resultadoDiv = document.getElementById('resultado');
                 resultadoDiv.innerHTML = '⏳ Obteniendo lista de departamentos...';
 
-                // Paso 1: Obtener la lista de departamentos
                 fetch('/departamentos')
                     .then(response => response.json())
                     .then(data => {
@@ -881,7 +901,6 @@ def home():
                             return;
                         }
 
-                        // Filtrar departamentos que necesitan ser agregados (en_json < cantidad)
                         const pendientes = data.departamentos.filter(d => d.en_json < d.cantidad);
                         
                         if (pendientes.length === 0) {
@@ -892,21 +911,17 @@ def home():
                             return;
                         }
 
-                        // Mostrar cuántos departamentos vamos a procesar
                         resultadoDiv.innerHTML = `⏳ Agregando plazas de ${pendientes.length} departamento(s) pendientes... (0/${pendientes.length})`;
                         
-                        // Paso 2: Procesar cada departamento pendiente en secuencia
                         let procesados = 0;
                         let totalAgregados = 0;
                         let errores = [];
 
                         function procesarSiguiente() {
                             if (procesados >= pendientes.length) {
-                                // Todos procesados
                                 const mensaje = `✅ Proceso completado. Se agregaron plazas de ${totalAgregados} departamento(s). ${errores.length > 0 ? 'Hubo ' + errores.length + ' error(es).' : ''}`;
                                 resultadoDiv.innerHTML = mensaje;
                                 alert(mensaje);
-                                // Refrescar la tabla y el JSON para ver los cambios
                                 verDepartamentos();
                                 actualizarContenidoJSON();
                                 btn.disabled = false;
@@ -918,7 +933,6 @@ def home():
                             const nombre = depto.nombre;
                             resultadoDiv.innerHTML = `⏳ Agregando plazas de ${nombre}... (${procesados + 1}/${pendientes.length})`;
 
-                            // Llamar a agregarDepartamento (pero sin confirmación y sin alertas)
                             fetch('/agregar-departamento', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
@@ -941,7 +955,6 @@ def home():
                             });
                         }
 
-                        // Iniciar el procesamiento secuencial
                         procesarSiguiente();
 
                     })
@@ -971,7 +984,6 @@ def home():
                     } else {
                         resultadoDiv.innerHTML = `✅ ${data.mensaje} (Restantes: ${data.restantes || 0})`;
                         alert(`✅ ${data.mensaje}`);
-                        // Refrescar la tabla de departamentos y el JSON mostrado
                         verDepartamentos();
                         actualizarContenidoJSON();
                     }
@@ -1060,16 +1072,13 @@ def cargar_json():
     if not data:
         return {"error": "El JSON está vacío (lista vacía)"}, 400
 
-    # Guardar los datos
     guardar_datos_actuales(data)
-    # También guardar el total del mapa actual
     try:
         total_mapa = obtener_total_plazas_mapa()
         guardar_total_mapa_actual(total_mapa)
     except Exception as e:
-        # Si falla, no es crítico, pero lo registramos
         print(f"Error al obtener total del mapa: {e}")
-    
+
     return {"mensaje": f"✅ JSON guardado correctamente ({len(data)} plazas)"}
 
 @app.route("/verjson")
@@ -1091,10 +1100,10 @@ def obtener_departamentos():
     try:
         from collections import Counter
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(URL_PAGINA, headers=headers, timeout=30)
+        session = get_session()   # [PROXY]
+        response = session.get(URL_PAGINA, headers=headers, timeout=30)
         response.raise_for_status()
 
-        # Extraer títulos de marcadores (departamentos con plazas)
         patron = r'L\.marker\(\[.*?\],\s*\{[^}]*title:\s*[\'"]([^\'"]+)[\'"][^}]*\}\)'
         coincidencias = re.findall(patron, response.text, re.DOTALL)
         if not coincidencias:
@@ -1104,10 +1113,8 @@ def obtener_departamentos():
         if not coincidencias:
             return {"error": "No se encontraron departamentos"}, 404
 
-        # Contar plazas por departamento en el mapa
         contador_mapa = Counter(coincidencias)
 
-        # Cargar el JSON actual y contar plazas por departamento
         plazas_json = cargar_datos_anteriores()
         contador_json = defaultdict(int)
         for p in plazas_json:
@@ -1115,10 +1122,8 @@ def obtener_departamentos():
             if depto:
                 contador_json[depto] += 1
 
-        # Construir la lista combinada
         departamentos = []
         for nombre, cantidad_mapa in contador_mapa.items():
-            # Extraer solo el nombre del departamento (primera parte antes de " - ")
             nombre_depto = nombre.split(" - ")[0].strip()
             cantidad_json = contador_json.get(nombre_depto, 0)
             departamentos.append({
@@ -1127,7 +1132,6 @@ def obtener_departamentos():
                 "en_json": cantidad_json
             })
 
-        # Ordenar por cantidad (de mayor a menor)
         departamentos.sort(key=lambda x: x["cantidad"], reverse=True)
 
         return {
@@ -1153,7 +1157,6 @@ def agregar_departamento():
 
         departamento_nombre = data["departamento"].strip()
 
-        # Obtener plazas del departamento
         try:
             plazas_departamento = obtener_vacantes_por_departamento(departamento_nombre)
         except ValueError as e:
@@ -1162,12 +1165,10 @@ def agregar_departamento():
         if not plazas_departamento:
             return {"error": f"No se encontraron plazas para '{departamento_nombre}'."}, 404
 
-        # Cargar JSON anterior y fusionar
         plazas_bd = cargar_datos_anteriores()
         plazas_fusionadas, ids_nuevas = fusionar_plazas(plazas_bd, plazas_departamento)
         guardar_datos_actuales(plazas_fusionadas)
 
-        # Actualizar también el total del mapa (para mantener consistencia)
         try:
             total_mapa = obtener_total_plazas_mapa()
             guardar_total_mapa_actual(total_mapa)
@@ -1194,9 +1195,6 @@ def limpiar_vencidas():
         vigentes, vencidas = limpiar_plazas_vencidas(plazas)
         if vencidas:
             guardar_datos_actuales(vigentes)
-            # Opcional: actualizar total_mapa.json con el nuevo conteo (si quieres)
-            # total_mapa = obtener_total_plazas_mapa()
-            # guardar_total_mapa_actual(total_mapa)
             return {
                 "mensaje": f"Se eliminaron {len(vencidas)} plazas vencidas.",
                 "eliminadas": len(vencidas),
