@@ -3,6 +3,7 @@ import requests
 import os
 import re
 import json
+import html
 import threading
 import time
 from datetime import datetime, timedelta
@@ -667,18 +668,21 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
     anteriores_por_id = {p["id"]: p for p in plazas_anteriores}
 
     for depto in sorted(deptos.keys()):
-        lineas.append(f"📌 <b>{depto}</b>")
+        lineas.append(f"📌 <b>{html.escape(depto)}</b>")
         for p in sorted(deptos[depto], key=lambda x: x["area"]):
             es_nueva = p["id"] in ids_nuevas
-            
+
             cambio = None
             if not es_nueva and p["id"] in anteriores_por_id:
                 anterior = anteriores_por_id[p["id"]]
                 if p["postulados"] != anterior["postulados"]:
                     cambio = (anterior["postulados"], p["postulados"])
-            
+
+            area_esc = html.escape(p["area"])
+            municipio_esc = html.escape(p["municipio"])
+
             if es_nueva:
-                linea = f"  • {p['area']} ({p['municipio']}) 🆕 – {p['postulados']} postulados"
+                linea = f"  • {area_esc} ({municipio_esc}) 🆕 – {p['postulados']} postulados"
             else:
                 flecha = ""
                 if cambio:
@@ -686,8 +690,8 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
                         flecha = " ↑"
                     elif cambio[1] < cambio[0]:
                         flecha = " ↓"
-                linea = f"  • {p['area']} ({p['municipio']}){flecha} – {p['postulados']} postulados"
-            
+                linea = f"  • {area_esc} ({municipio_esc}){flecha} – {p['postulados']} postulados"
+
             lineas.append(linea)
         lineas.append("")
 
@@ -697,12 +701,62 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
     return "\n".join(lineas)
 
 def enviar_telegram(mensaje):
+    """
+    Envía un mensaje a Telegram, dividiéndolo en varias partes si supera
+    el límite de 4096 caracteres que impone la API de Telegram, y
+    registrando en logs cualquier error HTTP (antes se ignoraba en
+    silencio, por eso los mensajes largos "desaparecían" sin avisar).
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    datos = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "HTML"}
-    try:
-        requests.post(url, data=datos, timeout=10)
-    except Exception as e:
-        print(f"Error Telegram: {e}")
+    LIMITE = 4000  # margen de seguridad bajo el límite real de Telegram (4096)
+
+    partes = _dividir_mensaje(mensaje, LIMITE)
+
+    for i, parte in enumerate(partes, start=1):
+        datos = {"chat_id": TELEGRAM_CHAT_ID, "text": parte, "parse_mode": "HTML"}
+        try:
+            r = requests.post(url, data=datos, timeout=10)
+            if r.status_code != 200:
+                print(f"⚠️ Error Telegram (parte {i}/{len(partes)}): {r.status_code} - {r.text}")
+        except Exception as e:
+            print(f"⚠️ Error Telegram (parte {i}/{len(partes)}): {e}")
+
+
+def _dividir_mensaje(mensaje, limite):
+    """
+    Divide un mensaje largo en partes que no superen `limite` caracteres,
+    intentando cortar por líneas completas para no romper el HTML a la mitad.
+    Si una sola línea es más larga que el límite (caso extremo), se corta
+    igual para evitar un bucle infinito.
+    """
+    lineas = mensaje.split("\n")
+    partes = []
+    actual = ""
+
+    for linea in lineas:
+        candidato = f"{actual}\n{linea}" if actual else linea
+
+        if len(candidato) <= limite:
+            actual = candidato
+            continue
+
+        # La línea no cabe junto con lo acumulado: cerramos la parte actual
+        if actual:
+            partes.append(actual)
+            actual = ""
+
+        if len(linea) <= limite:
+            actual = linea
+        else:
+            # Línea individual demasiado larga: la troceamos a la fuerza
+            for i in range(0, len(linea), limite):
+                partes.append(linea[i:i + limite])
+            actual = ""
+
+    if actual:
+        partes.append(actual)
+
+    return partes if partes else [mensaje[:limite]]
 
 # ========== ENDPOINTS DE DIAGNÓSTICO AGREGADOS ==========
 
@@ -724,7 +778,7 @@ def home():
         with open(ruta, "r", encoding="utf-8") as f:
             contenido = json.load(f)
 
-    html = """
+    html_page = """
     <!DOCTYPE html>
     <html>
     <head>
@@ -1091,11 +1145,11 @@ def home():
     </body>
     </html>
     """
-    html = html.replace(
+    html_page = html_page.replace(
         "__CONTENIDO_JSON__",
         json.dumps(contenido, indent=2, ensure_ascii=False)
     )
-    return html
+    return html_page
 
 @app.route("/limpiar-json", methods=["POST"])
 def limpiar_json():
