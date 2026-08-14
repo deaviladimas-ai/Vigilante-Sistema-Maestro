@@ -101,27 +101,26 @@ class ScrapeDoSession:
         return self._request("POST", url, headers=headers, data=data, timeout=timeout)
 
     def _request(self, method, url, headers=None, data=None, timeout=30):
-        # Construir parámetros para scrape.do
-        params = {
+        # Construir el payload JSON para scrape.do
+        payload = {
             "token": self.token,
-            "url": url,  # Asegurar que la URL completa se pasa
+            "url": url,
             "method": method.upper(),
+            "headers": headers or {},
+            "data": data or {},
             "country": "co",
-            "render_js": "false",
-            "timeout": str(timeout * 1000),  # milisegundos
+            "render_js": False,          # ¡CORRECTO! (antes era render_is)
+            "timeout": timeout * 1000,   # milisegundos
         }
-        # Siempre enviar headers y data como JSON (aunque estén vacíos)
-        params["headers"] = json.dumps(headers or {})
-        params["data"] = json.dumps(data or {})
+        # Log para depuración (se verá en los logs de Render)
+        print(f"📤 Enviando a scrape.do: {payload['url']} con método {payload['method']}")
 
-        # Log para depuración (opcional, puedes imprimir en consola)
-        print(f"🔍 Petición a scrape.do: {SCRAPE_DO_URL} con params: {params}")
-
-        resp = requests.get(SCRAPE_DO_URL, params=params, timeout=timeout + 10)
+        # Enviar POST con JSON (así lo espera scrape.do)
+        resp = requests.post(SCRAPE_DO_URL, json=payload, timeout=timeout + 10)
         resp.raise_for_status()
         result = resp.json()
         return ScrapeDoResponse(result)
-
+        
 def get_session():
     """Devuelve una sesión (normal o con proxy) según la configuración."""
     if USE_PROXY:
