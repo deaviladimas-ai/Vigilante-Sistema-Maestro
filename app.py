@@ -3,6 +3,8 @@ import requests
 import os
 import re
 import json
+import threading
+import time
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from bs4 import BeautifulSoup
@@ -66,6 +68,18 @@ DEPARTAMENTOS_CODIGOS = {
 MAX_PAGINAS = 60
 FILAS_POR_PAGINA = 6
 
+# ========== HILO DE ACTUALIZACIÓN DE POSTULADOS EN SEGUNDO PLANO ==========
+# Cada cuántos segundos se refrescan los postulados de los departamentos que
+# YA están guardados en plazas.json. Ajustable sin tocar código con la
+# variable de entorno INTERVALO_ACTUALIZACION_POSTULADOS (en segundos).
+INTERVALO_ACTUALIZACION_POSTULADOS = int(os.environ.get("INTERVALO_ACTUALIZACION_POSTULADOS", 600))
+
+# Protege plazas.json de lecturas/escrituras simultáneas entre el hilo de
+# fondo y las peticiones Flask. Es RLock (reentrante) para poder envolver
+# todo un ciclo "leer + fusionar + guardar" y, dentro de él, seguir llamando
+# a cargar_datos_anteriores()/guardar_datos_actuales() sin bloquearse a sí mismo.
+lock_json = threading.RLock()
+
 # ============================================================
 # FUNCIONES ELIMINADAS (comentadas o simplemente no existen)
 # ============================================================
@@ -74,20 +88,22 @@ FILAS_POR_PAGINA = 6
 # --------------------------------------------------------
 
 def cargar_datos_anteriores():
-    if os.path.exists(ARCHIVO_DATOS):
-        try:
-            with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+    with lock_json:
+        if os.path.exists(ARCHIVO_DATOS):
+            try:
+                with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
 
 def guardar_datos_actuales(plazas):
-    if plazas:
-        with open(ARCHIVO_DATOS, "w", encoding="utf-8") as f:
-            json.dump(plazas, f, ensure_ascii=False, indent=2)
-    else:
-        print("⚠️ Se intentó guardar una lista vacía de plazas. No se sobrescribió el archivo.")
+    with lock_json:
+        if plazas:
+            with open(ARCHIVO_DATOS, "w", encoding="utf-8") as f:
+                json.dump(plazas, f, ensure_ascii=False, indent=2)
+        else:
+            print("⚠️ Se intentó guardar una lista vacía de plazas. No se sobrescribió el archivo.")
 
 # También necesitamos obtener_total_plazas_mapa y guardar_total_mapa_actual para mantener consistencia
 def obtener_total_plazas_mapa():
@@ -328,6 +344,67 @@ def fusionar_plazas(plazas_bd, plazas_scrapeadas):
             bd_por_id[p["id"]] = dict(p)
             ids_nuevas.add(p["id"])
     return list(bd_por_id.values()), ids_nuevas
+
+# ========== HILO: REFRESCO DE POSTULADOS POR DEPARTAMENTO ==========
+# --------------------------------------------------------
+
+def obtener_departamentos_en_json():
+    """
+    Devuelve los departamentos únicos que YA existen en plazas.json.
+    A diferencia de obtener_departamentos_del_mapa() (que consulta la web),
+    esta función solo mira lo que ya tenemos guardado.
+    """
+    plazas = cargar_datos_anteriores()
+    departamentos = set()
+    for p in plazas:
+        depto = (p.get("departamento") or "").strip()
+        if depto and depto.lower() != "sin departamento":
+            departamentos.add(depto)
+    return sorted(departamentos)
+
+def actualizar_postulados_departamento(nombre_departamento):
+    """
+    Vuelve a scrapear un departamento y fusiona el resultado en plazas.json.
+    El scraping (lento, es red) se hace SIN el lock; la lectura+fusión+
+    escritura del JSON (rápida) se hace protegida por lock_json para que no
+    choque con otra petición Flask o con otra iteración de este mismo hilo.
+    """
+    plazas_scrapeadas = obtener_vacantes_por_departamento(nombre_departamento)
+    with lock_json:
+        plazas_bd = cargar_datos_anteriores()
+        plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, plazas_scrapeadas)
+        guardar_datos_actuales(plazas_bd)
+    return len(plazas_scrapeadas), len(ids_nuevas)
+
+def hilo_actualizador_postulados():
+    """
+    Hilo independiente en segundo plano.
+    Cada INTERVALO_ACTUALIZACION_POSTULADOS segundos:
+      1. Lee plazas.json y arma la lista de departamentos que ya tiene guardados.
+      2. Vuelve a scrapear cada uno de esos departamentos.
+      3. Fusiona el resultado en plazas.json, refrescando "postulados"
+         (y de paso agrega alguna plaza nueva si apareció en un
+         departamento que ya veníamos siguiendo).
+    No consulta el mapa ni envía Telegram: solo mantiene al día los
+    departamentos que /check ya decidió trackear.
+    """
+    print(f"🧵 Hilo actualizador de postulados iniciado (cada {INTERVALO_ACTUALIZACION_POSTULADOS}s).")
+    while True:
+        try:
+            departamentos = obtener_departamentos_en_json()
+            if departamentos:
+                print(f"🔄 Refrescando postulados de {len(departamentos)} departamento(s): {', '.join(departamentos)}")
+            for depto in departamentos:
+                try:
+                    encontradas, nuevas = actualizar_postulados_departamento(depto)
+                    print(f"   ✔ {depto}: {encontradas} plazas revisadas, {nuevas} nueva(s)")
+                except Exception as e:
+                    print(f"   ✘ Error actualizando postulados de '{depto}': {e}")
+        except Exception as e:
+            print(f"⚠️ Error en hilo actualizador de postulados: {e}")
+        time.sleep(INTERVALO_ACTUALIZACION_POSTULADOS)
+
+# --------------------------------------------------------
 
 #eliminar plaza
 #--------------
@@ -1206,6 +1283,14 @@ def limpiar_vencidas():
             return {"mensaje": "No hay plazas vencidas.", "eliminadas": 0}, 200
     except Exception as e:
         return {"error": str(e)}, 500
+
+# Arranca al importar el módulo (no solo dentro de __main__) para que
+# también funcione cuando Render lo despliega con Gunicorn (gunicorn app:app).
+# ⚠️ Si usas más de 1 worker de Gunicorn, este hilo arranca UNA VEZ POR
+# WORKER y terminarás scrapeando el mismo departamento varias veces en
+# paralelo. Con Render, usa un solo worker (gunicorn app:app --workers 1)
+# o mueve esta tarea a un Background Worker/Cron Job aparte.
+threading.Thread(target=hilo_actualizador_postulados, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
