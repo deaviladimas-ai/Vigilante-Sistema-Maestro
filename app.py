@@ -8,9 +8,49 @@ from collections import defaultdict, Counter
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
+import threading
+import time
+
+
+
+def request_with_retries(method, url, reintentos=3, espera_base=5, **kwargs):
+    """
+    Realiza una petición HTTP con reintentos ante errores de red o 5xx.
+    - method: 'GET' o 'POST'
+    - reintentos: número máximo de intentos
+    - espera_base: segundos de espera inicial (se duplica con cada reintento)
+    - kwargs: argumentos adicionales para requests (headers, data, timeout, etc.)
+    """
+    for i in range(reintentos):
+        try:
+            if method.upper() == 'GET':
+                r = requests.get(url, **kwargs)
+            elif method.upper() == 'POST':
+                r = requests.post(url, **kwargs)
+            else:
+                raise ValueError("Método no soportado")
+
+            # Si la respuesta es exitosa (2xx), la devolvemos
+            r.raise_for_status()
+            return r
+
+        except requests.exceptions.RequestException as e:
+            print(f"   ⚠️ Intento {i+1}/{reintentos} falló: {e}")
+            if i == reintentos - 1:
+                raise  # Re-lanzamos la última excepción
+            # Espera exponencial: 5s, 10s, 20s...
+            espera = espera_base * (2 ** i)
+            print(f"   🔄 Reintentando en {espera} segundos...")
+            time.sleep(espera)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB
+
+####dimas
+INTERVALO_ACTUALIZACION_SEGUNDOS = 180  # 3 minutos
+ARCHIVO_ULTIMA_ACT = "ultima_actualizacion.json"
+lock_actualizacion = threading.Lock()
+####dimas
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -38,8 +78,10 @@ DEPARTAMENTOS_CODIGOS = {
     "boyacá": "15",
     "caldas": "17",
     "caquetá": "18",
+    "Caquetá": "18",
     "casanare": "85",
     "cauca": "19",
+    "cesár": "20",
     "cesar": "20",
     "chocó": "27",
     "córdoba": "23",
@@ -91,8 +133,7 @@ def guardar_datos_actuales(plazas):
 
 # También necesitamos obtener_total_plazas_mapa y guardar_total_mapa_actual para mantener consistencia
 def obtener_total_plazas_mapa():
-    r = requests.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-    r.raise_for_status()
+    r = request_with_retries('GET', URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     patron = r"alt:\s*'DEP-\d+',\s*title:\s*'([^']+)'"
     coincidencias = re.findall(patron, r.text)
     return len(coincidencias)
@@ -105,7 +146,7 @@ def guardar_total_mapa_actual(total_mapa):
 # --------------------------------------------------------
 
 def obtener_viewstate(session):
-    r = session.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    r = request_with_retries('GET', URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     m = re.search(r'javax\.faces\.ViewState" value="([^"]+)"', r.text)
     return m.group(1) if m else None
 
@@ -190,13 +231,9 @@ def desambiguar_ids(vacantes):
     return vacantes
 
 def cambiar_filtro_departamento(session, viewstate, codigo_departamento):
-    """
-    Simula el cambio del combo 'Departamento' del formulario de búsqueda.
-    Ahora usa form-busqueda:idInputDepartamento en lugar de idInputSecretaria.
-    """
     data = {
         "javax.faces.partial.ajax": "true",
-        "javax.faces.source": "form-busqueda:idInputDepartamento",  # Cambio aquí
+        "javax.faces.source": "form-busqueda:idInputDepartamento",
         "javax.faces.partial.execute": "@all",
         "javax.faces.partial.render": "accordion",
         "javax.faces.behavior.event": "change",
@@ -204,9 +241,9 @@ def cambiar_filtro_departamento(session, viewstate, codigo_departamento):
         "form-busqueda": "form-busqueda",
         "javax.faces.ViewState": viewstate,
         "form-busqueda:idInputSecretaria_focus": "",
-        "form-busqueda:idInputSecretaria_input": "",          # Vacío
+        "form-busqueda:idInputSecretaria_input": "",
         "form-busqueda:idInputDepartamento_focus": "",
-        "form-busqueda:idInputDepartamento_input": codigo_departamento,  # Nuevo campo
+        "form-busqueda:idInputDepartamento_input": codigo_departamento,
         "form-busqueda:idInputEstablecimiento_filter": "",
         "form-busqueda:idInputArea_focus": "",
         "form-busqueda:idInputArea_input": "",
@@ -218,15 +255,28 @@ def cambiar_filtro_departamento(session, viewstate, codigo_departamento):
         "form-busqueda:info-punto": "",
         "form-busqueda:tabla-vacantes_rppDD": str(FILAS_POR_PAGINA),
     }
-    r = session.post(URL_PAGINA, headers=HEADERS_AJAX, data=data, timeout=30)
+    # Usamos request_with_retries con session.post, pero debemos pasar la sesión como argumento.
+    # Hacemos una función interna que use la sesión.
+    def hacer_post():
+        return session.post(URL_PAGINA, headers=HEADERS_AJAX, data=data, timeout=30)
+    
+    # Llamamos a request_with_retries con un método personalizado (no GET/POST estándar)
+    # O simplemente implementamos reintentos aquí:
+    for i in range(3):
+        try:
+            r = session.post(URL_PAGINA, headers=HEADERS_AJAX, data=data, timeout=30)
+            r.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            print(f"   ⚠️ Error en cambio de filtro (intento {i+1}/3): {e}")
+            if i == 2:
+                raise
+            time.sleep(5)
     resultado = extraer_actualizaciones(r.text)
     nuevo_viewstate = resultado["viewstate"] or viewstate
     return resultado["html"], nuevo_viewstate
 
 def pedir_pagina_filtrada(session, viewstate, first, rows, codigo_departamento):
-    """
-    Pide una página de resultados YA con el filtro de departamento activo.
-    """
     data = {
         "javax.faces.partial.ajax": "true",
         "javax.faces.source": "form-busqueda:tabla-vacantes",
@@ -239,9 +289,9 @@ def pedir_pagina_filtrada(session, viewstate, first, rows, codigo_departamento):
         "form-busqueda": "form-busqueda",
         "javax.faces.ViewState": viewstate,
         "form-busqueda:idInputSecretaria_focus": "",
-        "form-busqueda:idInputSecretaria_input": "",          # Vacío
+        "form-busqueda:idInputSecretaria_input": "",
         "form-busqueda:idInputDepartamento_focus": "",
-        "form-busqueda:idInputDepartamento_input": codigo_departamento,  # Cambio
+        "form-busqueda:idInputDepartamento_input": codigo_departamento,
         "form-busqueda:idInputEstablecimiento_filter": "",
         "form-busqueda:idInputArea_focus": "",
         "form-busqueda:idInputArea_input": "",
@@ -253,19 +303,24 @@ def pedir_pagina_filtrada(session, viewstate, first, rows, codigo_departamento):
         "form-busqueda:info-punto": "",
         "form-busqueda:tabla-vacantes_rppDD": str(rows),
     }
-    r = session.post(URL_PAGINA, headers=HEADERS_AJAX, data=data, timeout=30)
+    for i in range(3):
+        try:
+            r = session.post(URL_PAGINA, headers=HEADERS_AJAX, data=data, timeout=30)
+            r.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            print(f"   ⚠️ Error en paginación (intento {i+1}/3): {e}")
+            if i == 2:
+                raise
+            time.sleep(5)
     resultado = extraer_actualizaciones(r.text)
     nuevo_viewstate = resultado["viewstate"] or viewstate
     return resultado["html"], nuevo_viewstate
 
 def obtener_vacantes_por_departamento(nombre_departamento):
-    """
-    Obtiene TODAS las vacantes de un departamento usando el filtro.
-    """
     nombre_clean = nombre_departamento.lower().strip()
     codigo = DEPARTAMENTOS_CODIGOS.get(nombre_clean)
     if not codigo:
-        # Búsqueda flexible
         for key, value in DEPARTAMENTOS_CODIGOS.items():
             if nombre_clean in key or key in nombre_clean:
                 codigo = value
@@ -274,14 +329,23 @@ def obtener_vacantes_por_departamento(nombre_departamento):
         raise ValueError(f"Departamento '{nombre_departamento}' no encontrado en el mapeo")
 
     session = requests.Session()
-    viewstate = obtener_viewstate(session)
+    # Reintentos para obtener viewstate
+    for i in range(3):
+        try:
+            viewstate = obtener_viewstate(session)
+            if viewstate:
+                break
+        except Exception as e:
+            print(f"   ⚠️ Error obteniendo viewstate (intento {i+1}/3): {e}")
+            if i == 2:
+                raise
+            time.sleep(5)
     if not viewstate:
         raise RuntimeError("No se pudo obtener el ViewState inicial")
 
-    # Aplicar filtro de departamento
+    # Aplicar filtro (ya tiene reintentos internos)
     _, viewstate = cambiar_filtro_departamento(session, viewstate, codigo)
 
-    # Paginar resultados
     todas = []
     first = 0
     for _ in range(MAX_PAGINAS):
@@ -360,19 +424,17 @@ def limpiar_plazas_vencidas(plazas):
 
 def ejecutar_vigilante(notificar_siempre=False):
     """
-    Flujo principal automatizado:
-    1. Limpiar plazas vencidas del JSON.
-    2. Obtener total del mapa y total del JSON.
-    3. Si faltan plazas, agregar todas las pendientes por departamento.
-    4. Detectar cambios (plazas nuevas, postulados que cambiaron).
-    5. Notificar por Telegram (si hay cambios o si se fuerza).
+    Flujo principal del vigilante:
+    1. Carga el JSON actual y hace una copia de respaldo.
+    2. Limpia plazas vencidas.
+    3. Si notificar_siempre=True, fuerza una actualización inmediata (scraping de departamentos con plazas).
+    4. Obtiene el total del mapa y el total anterior.
+    5. Detecta cambios comparando el JSON actual con la copia anterior.
+    6. Notifica si hay cambios o si se fuerza.
     """
     try:
-        # 1. Cargar JSON actual (base de datos)
+        # 1. Cargar JSON actual
         plazas_bd = cargar_datos_anteriores()
-        total_json_actual = len(plazas_bd)
-
-        # Guardar copia ANTES de cualquier modificación (para detectar cambios)
         plazas_antes = plazas_bd.copy()
 
         # 2. Limpiar plazas vencidas
@@ -380,30 +442,19 @@ def ejecutar_vigilante(notificar_siempre=False):
         if plazas_vencidas:
             guardar_datos_actuales(plazas_vigentes)
             plazas_bd = plazas_vigentes
-            total_json_actual = len(plazas_bd)
 
-        # 3. Obtener total del mapa actual y el anterior (de total_mapa.json)
+        # 3. Si se fuerza, actualizar datos ahora (scraping de departamentos con plazas)
+        if notificar_siempre:
+            actualizar_departamentos_con_plazas()
+            plazas_bd = cargar_datos_anteriores()  # Recargar después de actualizar
+
+        # 4. Obtener total del mapa y total anterior
         total_mapa = obtener_total_plazas_mapa()
         total_mapa_anterior = cargar_total_mapa_anterior()
 
-        # 4. Si hay plazas faltantes, agregarlas automáticamente
-        if total_mapa > total_json_actual:
-            departamentos_pendientes = obtener_departamentos_pendientes()
-            for depto in departamentos_pendientes:
-                try:
-                    plazas_depto = obtener_vacantes_por_departamento(depto)
-                    plazas_bd, _ = fusionar_plazas(plazas_bd, plazas_depto)
-                    guardar_datos_actuales(plazas_bd)
-                except Exception as e:
-                    print(f"Error agregando {depto}: {e}")
-            # Después de agregar, recargar plazas_bd y total_json_actual
-            plazas_bd = cargar_datos_anteriores()
-            total_json_actual = len(plazas_bd)
-
-        # 5. Detectar cambios comparando plazas_bd con plazas_antes
+        # 5. Detectar cambios comparando con la copia anterior
         cambios = detectar_cambios(plazas_bd, plazas_antes)
 
-        # 6. Determinar si notificar
         hay_cambios = (
             (total_mapa != total_mapa_anterior) or
             cambios["total_nuevas"] > 0 or
@@ -412,22 +463,20 @@ def ejecutar_vigilante(notificar_siempre=False):
         )
         debe_notificar = hay_cambios or notificar_siempre
 
+        # 6. Notificar si corresponde
         if debe_notificar:
-            # Extraer IDs de plazas nuevas para el resumen
             ids_nuevas = {p["id"] for p in cambios["nuevas"]}
             resumen = construir_resumen(
                 plazas_bd,
-                plazas_bd,  # plazas_scrapeadas (usamos las mismas, pues ya están actualizadas)
+                plazas_bd,
                 total_mapa,
                 ids_nuevas,
                 total_mapa_anterior
             )
             enviar_telegram(resumen)
-            # Guardar total del mapa actual para futuras comparaciones
             guardar_total_mapa_actual(total_mapa)
             return "Notificación enviada."
         else:
-            # Actualizar total_mapa.json aunque no haya cambios (para mantener sincronía)
             guardar_total_mapa_actual(total_mapa)
             return "Sin cambios notificables."
 
@@ -626,6 +675,103 @@ def enviar_telegram(mensaje):
         requests.post(url, data=datos, timeout=10)
     except Exception as e:
         print(f"Error Telegram: {e}")
+
+
+##-----------------------segundo hilo
+def obtener_departamentos_con_plazas():
+    try:
+        r = request_with_retries('GET', URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        patron = r'title:\s*[\'"]([^\'"]+)[\'"]'
+        coincidencias = re.findall(patron, r.text)
+        deptos = set()
+        for titulo in coincidencias:
+            partes = titulo.split(" - ")
+            if partes:
+                deptos.add(partes[0].strip())
+        return deptos
+    except Exception as e:
+        print(f"Error al obtener departamentos con plazas: {e}")
+        return set()
+
+def actualizar_departamentos_con_plazas():
+    """
+    Obtiene la lista de departamentos desde el JSON local (no desde el mapa),
+    y scrapea cada uno de ellos para actualizar el JSON.
+    Usa un lock para evitar ejecuciones simultáneas.
+    """
+    if not lock_actualizacion.acquire(blocking=False):
+        print("⏳ Actualización ya en curso. Omitiendo esta ejecución.")
+        return
+
+    try:
+        print("🔄 Actualizando departamentos existentes en el JSON...")
+        inicio = time.time()
+        
+        # 1. Cargar el JSON actual para obtener los departamentos que ya tenemos
+        plazas_bd = cargar_datos_anteriores()
+        deptos = set()
+        for p in plazas_bd:
+            depto = p.get("departamento")
+            if depto:
+                deptos.add(depto)
+        
+        if not deptos:
+            print("⚠️ No hay departamentos en el JSON. Omitiendo actualización.")
+            return
+
+        print(f"📌 Departamentos a actualizar (desde JSON): {len(deptos)}")
+        
+        # plazas_bd ya está cargado, lo usaremos para ir fusionando
+        total_deptos = len(deptos)
+
+        for i, depto in enumerate(deptos, 1):
+            try:
+                print(f"   ↳ ({i}/{total_deptos}) Actualizando {depto}...")
+                plazas_depto = obtener_vacantes_por_departamento(depto)
+                plazas_bd, _ = fusionar_plazas(plazas_bd, plazas_depto)
+                # Guardamos cada 3 departamentos para no perder progreso
+                if i % 3 == 0 or i == total_deptos:
+                    guardar_datos_actuales(plazas_bd)
+            except Exception as e:
+                print(f"   ❌ Error en {depto}: {e}")
+
+        guardar_datos_actuales(plazas_bd)
+        guardar_timestamp_actualizacion()
+        duracion = time.time() - inicio
+        print(f"✅ Actualización completada en {duracion:.2f} segundos.")
+    except Exception as e:
+        print(f"⚠️ Error en actualizar_departamentos_con_plazas: {e}")
+    finally:
+        lock_actualizacion.release()
+
+def guardar_timestamp_actualizacion():
+    with open(ARCHIVO_ULTIMA_ACT, "w") as f:
+        json.dump({"timestamp": datetime.now(ZONA_COLOMBIA).isoformat()}, f)
+
+def leer_timestamp_actualizacion():
+    if os.path.exists(ARCHIVO_ULTIMA_ACT):
+        try:
+            with open(ARCHIVO_ULTIMA_ACT, "r") as f:
+                data = json.load(f)
+                return data.get("timestamp")
+        except:
+            pass
+    return None
+
+def actualizador_automatico():
+    """
+    Función que corre en un hilo separado. Cada INTERVALO_ACTUALIZACION_SEGUNDOS
+    ejecuta la actualización de los departamentos con plazas.
+    """
+    while True:
+        try:
+            time.sleep(INTERVALO_ACTUALIZACION_SEGUNDOS)
+            actualizar_departamentos_con_plazas()
+        except Exception as e:
+            print(f"⚠️ Error en el actualizador automático: {e}")
+            time.sleep(60)  # Espera 1 minuto y sigue
+
+
 
 # ========== ENDPOINTS DE DIAGNÓSTICO AGREGADOS ==========
 
@@ -1207,5 +1353,12 @@ def limpiar_vencidas():
     except Exception as e:
         return {"error": str(e)}, 500
 
+#if __name__ == "__main__":
+#    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 if __name__ == "__main__":
+    # Lanzar el hilo en segundo plano
+    hilo = threading.Thread(target=actualizador_automatico, daemon=True)
+    hilo.start()
+    print("🚀 Hilo actualizador iniciado (cada 3 minutos).")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
