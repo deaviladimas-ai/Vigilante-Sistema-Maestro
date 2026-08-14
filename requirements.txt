@@ -1,3 +1,5 @@
-flask
+Flask
 requests
-gunicorn
+beautifulsoup4
+lxml          # o html5lib, pero lxml es más rápido
+gunicorn      # ¡IMPORTANTE! para producción en Render
