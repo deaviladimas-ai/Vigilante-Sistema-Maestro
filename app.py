@@ -3,7 +3,8 @@ import requests
 import os
 import re
 import json
-import html
+import threading
+import time
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from bs4 import BeautifulSoup
@@ -67,6 +68,18 @@ DEPARTAMENTOS_CODIGOS = {
 MAX_PAGINAS = 60
 FILAS_POR_PAGINA = 6
 
+# ========== HILO DE ACTUALIZACIÓN DE POSTULADOS EN SEGUNDO PLANO ==========
+# Cada cuántos segundos se refrescan los postulados de los departamentos que
+# YA están guardados en plazas.json. Ajustable sin tocar código con la
+# variable de entorno INTERVALO_ACTUALIZACION_POSTULADOS (en segundos).
+INTERVALO_ACTUALIZACION_POSTULADOS = int(os.environ.get("INTERVALO_ACTUALIZACION_POSTULADOS", 600))
+
+# Protege plazas.json de lecturas/escrituras simultáneas entre el hilo de
+# fondo y las peticiones Flask. Es RLock (reentrante) para poder envolver
+# todo un ciclo "leer + fusionar + guardar" y, dentro de él, seguir llamando
+# a cargar_datos_anteriores()/guardar_datos_actuales() sin bloquearse a sí mismo.
+lock_json = threading.RLock()
+
 # ============================================================
 # FUNCIONES ELIMINADAS (comentadas o simplemente no existen)
 # ============================================================
@@ -75,20 +88,22 @@ FILAS_POR_PAGINA = 6
 # --------------------------------------------------------
 
 def cargar_datos_anteriores():
-    if os.path.exists(ARCHIVO_DATOS):
-        try:
-            with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+    with lock_json:
+        if os.path.exists(ARCHIVO_DATOS):
+            try:
+                with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
 
 def guardar_datos_actuales(plazas):
-    if plazas:
-        with open(ARCHIVO_DATOS, "w", encoding="utf-8") as f:
-            json.dump(plazas, f, ensure_ascii=False, indent=2)
-    else:
-        print("⚠️ Se intentó guardar una lista vacía de plazas. No se sobrescribió el archivo.")
+    with lock_json:
+        if plazas:
+            with open(ARCHIVO_DATOS, "w", encoding="utf-8") as f:
+                json.dump(plazas, f, ensure_ascii=False, indent=2)
+        else:
+            print("⚠️ Se intentó guardar una lista vacía de plazas. No se sobrescribió el archivo.")
 
 # También necesitamos obtener_total_plazas_mapa y guardar_total_mapa_actual para mantener consistencia
 def obtener_total_plazas_mapa():
@@ -329,6 +344,67 @@ def fusionar_plazas(plazas_bd, plazas_scrapeadas):
             bd_por_id[p["id"]] = dict(p)
             ids_nuevas.add(p["id"])
     return list(bd_por_id.values()), ids_nuevas
+
+# ========== HILO: REFRESCO DE POSTULADOS POR DEPARTAMENTO ==========
+# --------------------------------------------------------
+
+def obtener_departamentos_en_json():
+    """
+    Devuelve los departamentos únicos que YA existen en plazas.json.
+    A diferencia de obtener_departamentos_del_mapa() (que consulta la web),
+    esta función solo mira lo que ya tenemos guardado.
+    """
+    plazas = cargar_datos_anteriores()
+    departamentos = set()
+    for p in plazas:
+        depto = (p.get("departamento") or "").strip()
+        if depto and depto.lower() != "sin departamento":
+            departamentos.add(depto)
+    return sorted(departamentos)
+
+def actualizar_postulados_departamento(nombre_departamento):
+    """
+    Vuelve a scrapear un departamento y fusiona el resultado en plazas.json.
+    El scraping (lento, es red) se hace SIN el lock; la lectura+fusión+
+    escritura del JSON (rápida) se hace protegida por lock_json para que no
+    choque con otra petición Flask o con otra iteración de este mismo hilo.
+    """
+    plazas_scrapeadas = obtener_vacantes_por_departamento(nombre_departamento)
+    with lock_json:
+        plazas_bd = cargar_datos_anteriores()
+        plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, plazas_scrapeadas)
+        guardar_datos_actuales(plazas_bd)
+    return len(plazas_scrapeadas), len(ids_nuevas)
+
+def hilo_actualizador_postulados():
+    """
+    Hilo independiente en segundo plano.
+    Cada INTERVALO_ACTUALIZACION_POSTULADOS segundos:
+      1. Lee plazas.json y arma la lista de departamentos que ya tiene guardados.
+      2. Vuelve a scrapear cada uno de esos departamentos.
+      3. Fusiona el resultado en plazas.json, refrescando "postulados"
+         (y de paso agrega alguna plaza nueva si apareció en un
+         departamento que ya veníamos siguiendo).
+    No consulta el mapa ni envía Telegram: solo mantiene al día los
+    departamentos que /check ya decidió trackear.
+    """
+    print(f"🧵 Hilo actualizador de postulados iniciado (cada {INTERVALO_ACTUALIZACION_POSTULADOS}s).")
+    while True:
+        try:
+            departamentos = obtener_departamentos_en_json()
+            if departamentos:
+                print(f"🔄 Refrescando postulados de {len(departamentos)} departamento(s): {', '.join(departamentos)}")
+            for depto in departamentos:
+                try:
+                    encontradas, nuevas = actualizar_postulados_departamento(depto)
+                    print(f"   ✔ {depto}: {encontradas} plazas revisadas, {nuevas} nueva(s)")
+                except Exception as e:
+                    print(f"   ✘ Error actualizando postulados de '{depto}': {e}")
+        except Exception as e:
+            print(f"⚠️ Error en hilo actualizador de postulados: {e}")
+        time.sleep(INTERVALO_ACTUALIZACION_POSTULADOS)
+
+# --------------------------------------------------------
 
 #eliminar plaza
 #--------------
@@ -591,21 +667,18 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
     anteriores_por_id = {p["id"]: p for p in plazas_anteriores}
 
     for depto in sorted(deptos.keys()):
-        lineas.append(f"📌 <b>{html.escape(depto)}</b>")
+        lineas.append(f"📌 <b>{depto}</b>")
         for p in sorted(deptos[depto], key=lambda x: x["area"]):
             es_nueva = p["id"] in ids_nuevas
-
+            
             cambio = None
             if not es_nueva and p["id"] in anteriores_por_id:
                 anterior = anteriores_por_id[p["id"]]
                 if p["postulados"] != anterior["postulados"]:
                     cambio = (anterior["postulados"], p["postulados"])
-
-            area_esc = html.escape(p["area"])
-            municipio_esc = html.escape(p["municipio"])
-
+            
             if es_nueva:
-                linea = f"  • {area_esc} ({municipio_esc}) 🆕 – {p['postulados']} postulados"
+                linea = f"  • {p['area']} ({p['municipio']}) 🆕 – {p['postulados']} postulados"
             else:
                 flecha = ""
                 if cambio:
@@ -613,8 +686,8 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
                         flecha = " ↑"
                     elif cambio[1] < cambio[0]:
                         flecha = " ↓"
-                linea = f"  • {area_esc} ({municipio_esc}){flecha} – {p['postulados']} postulados"
-
+                linea = f"  • {p['area']} ({p['municipio']}){flecha} – {p['postulados']} postulados"
+            
             lineas.append(linea)
         lineas.append("")
 
@@ -624,62 +697,12 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
     return "\n".join(lineas)
 
 def enviar_telegram(mensaje):
-    """
-    Envía un mensaje a Telegram, dividiéndolo en varias partes si supera
-    el límite de 4096 caracteres que impone la API de Telegram, y
-    registrando en logs cualquier error HTTP (antes se ignoraba en
-    silencio, por eso los mensajes largos "desaparecían" sin avisar).
-    """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    LIMITE = 4000  # margen de seguridad bajo el límite real de Telegram (4096)
-
-    partes = _dividir_mensaje(mensaje, LIMITE)
-
-    for i, parte in enumerate(partes, start=1):
-        datos = {"chat_id": TELEGRAM_CHAT_ID, "text": parte, "parse_mode": "HTML"}
-        try:
-            r = requests.post(url, data=datos, timeout=10)
-            if r.status_code != 200:
-                print(f"⚠️ Error Telegram (parte {i}/{len(partes)}): {r.status_code} - {r.text}")
-        except Exception as e:
-            print(f"⚠️ Error Telegram (parte {i}/{len(partes)}): {e}")
-
-
-def _dividir_mensaje(mensaje, limite):
-    """
-    Divide un mensaje largo en partes que no superen `limite` caracteres,
-    intentando cortar por líneas completas para no romper el HTML a la mitad.
-    Si una sola línea es más larga que el límite (caso extremo), se corta
-    igual para evitar un bucle infinito.
-    """
-    lineas = mensaje.split("\n")
-    partes = []
-    actual = ""
-
-    for linea in lineas:
-        candidato = f"{actual}\n{linea}" if actual else linea
-
-        if len(candidato) <= limite:
-            actual = candidato
-            continue
-
-        # La línea no cabe junto con lo acumulado: cerramos la parte actual
-        if actual:
-            partes.append(actual)
-            actual = ""
-
-        if len(linea) <= limite:
-            actual = linea
-        else:
-            # Línea individual demasiado larga: la troceamos a la fuerza
-            for i in range(0, len(linea), limite):
-                partes.append(linea[i:i + limite])
-            actual = ""
-
-    if actual:
-        partes.append(actual)
-
-    return partes if partes else [mensaje[:limite]]
+    datos = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "HTML"}
+    try:
+        requests.post(url, data=datos, timeout=10)
+    except Exception as e:
+        print(f"Error Telegram: {e}")
 
 # ========== ENDPOINTS DE DIAGNÓSTICO AGREGADOS ==========
 
@@ -701,7 +724,7 @@ def home():
         with open(ruta, "r", encoding="utf-8") as f:
             contenido = json.load(f)
 
-    html_page = """
+    html = """
     <!DOCTYPE html>
     <html>
     <head>
@@ -1068,11 +1091,11 @@ def home():
     </body>
     </html>
     """
-    html_page = html_page.replace(
+    html = html.replace(
         "__CONTENIDO_JSON__",
         json.dumps(contenido, indent=2, ensure_ascii=False)
     )
-    return html_page
+    return html
 
 @app.route("/limpiar-json", methods=["POST"])
 def limpiar_json():
@@ -1260,6 +1283,14 @@ def limpiar_vencidas():
             return {"mensaje": "No hay plazas vencidas.", "eliminadas": 0}, 200
     except Exception as e:
         return {"error": str(e)}, 500
+
+# Arranca al importar el módulo (no solo dentro de __main__) para que
+# también funcione cuando Render lo despliega con Gunicorn (gunicorn app:app).
+# ⚠️ Si usas más de 1 worker de Gunicorn, este hilo arranca UNA VEZ POR
+# WORKER y terminarás scrapeando el mismo departamento varias veces en
+# paralelo. Con Render, usa un solo worker (gunicorn app:app --workers 1)
+# o mueve esta tarea a un Background Worker/Cron Job aparte.
+threading.Thread(target=hilo_actualizador_postulados, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
