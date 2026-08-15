@@ -36,7 +36,7 @@ DEPARTAMENTOS_CODIGOS = {
     "antioquia": "05",        #confirmado
     "arauca": "81",
     "atlántico": "08",
-    "Bogotá": "11",
+    "bogotá": "11",
     "bogotá d.c": "11",
     "bolívar": "13",
     "boyacá": "15",
