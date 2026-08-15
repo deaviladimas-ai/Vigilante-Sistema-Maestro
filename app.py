@@ -37,6 +37,7 @@ DEPARTAMENTOS_CODIGOS = {
     "arauca": "81",
     "atlántico": "08",
     "Bogotá": "11",
+    "bogotá d.c": "11",
     "bolívar": "13",
     "boyacá": "15",
     "caldas": "17",
