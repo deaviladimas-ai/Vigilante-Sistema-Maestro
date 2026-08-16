@@ -36,7 +36,8 @@ DEPARTAMENTOS_CODIGOS = {
     "antioquia": "05",        #confirmado
     "arauca": "81",
     "atlántico": "08",
-    "bogotá": "919",
+    "bogotá": "11",
+    "bogotá d.c": "11",
     "bolívar": "13",
     "boyacá": "15",
     "caldas": "17",
@@ -90,13 +91,6 @@ lock_ejecucion_vigilante = threading.Lock()
 # ============================================================
 
 def cargar_datos_anteriores():
-    with lock_json:
-        if os.path.exists(ARCHIVO_DATOS):
-            try:
-                with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return []
         return []
 
 def guardar_datos_actuales(plazas):
@@ -576,73 +570,6 @@ def contar_plazas_por_activacion(plazas):
     return contador_hoy, contador_ayer
 
 def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None, total_mapa_anterior=None):
-    """
-    Construye el mensaje para Telegram.
-    """
-    ids_nuevas = ids_nuevas or set()
-
-    total_hoy_json, total_ayer_calculado = contar_plazas_por_activacion(plazas_bd)
-
-    deptos = defaultdict(list)
-    for p in plazas_bd:
-        deptos[p["departamento"]].append(p)
-
-    lineas = []
-    lineas.append("🚨 <b>¡Plazas Sistema Maestro!</b> 🚨")
-    lineas.append("")
-
-    if total_mapa_anterior is not None:
-        diferencia = total_mapa - total_mapa_anterior
-        if diferencia > 0:
-            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>(+{diferencia})</b> ⬆️")
-        elif diferencia < 0:
-            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>({diferencia})</b> ⬇️")
-        else:
-            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} ↔️")
-    else:
-        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa}")
-
-    lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy_json}")
-    lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer_calculado}")
-
-    lineas.append("")
-    lineas.append("--- <b>TODAS LAS PLAZAS</b> ---")
-    lineas.append("")
-
-    plazas_anteriores = cargar_datos_anteriores()
-    anteriores_por_id = {p["id"]: p for p in plazas_anteriores}
-
-    for depto in sorted(deptos.keys()):
-        lineas.append(f"📌 <b>{html.escape(depto)}</b>")
-        for p in sorted(deptos[depto], key=lambda x: x["area"]):
-            es_nueva = p["id"] in ids_nuevas
-
-            cambio = None
-            if not es_nueva and p["id"] in anteriores_por_id:
-                anterior = anteriores_por_id[p["id"]]
-                if p["postulados"] != anterior["postulados"]:
-                    cambio = (anterior["postulados"], p["postulados"])
-
-            area_esc = html.escape(p["area"])
-            municipio_esc = html.escape(p["municipio"])
-
-            if es_nueva:
-                linea = f"  • {area_esc} ({municipio_esc}) 🆕 – {p['postulados']} postulados"
-            else:
-                flecha = ""
-                if cambio:
-                    if cambio[1] > cambio[0]:
-                        flecha = " ↑"
-                    elif cambio[1] < cambio[0]:
-                        flecha = " ↓"
-                linea = f"  • {area_esc} ({municipio_esc}){flecha} – {p['postulados']} postulados"
-
-            lineas.append(linea)
-        lineas.append("")
-
-    lineas.append("")
-    lineas.append(f'🔗 <a href="{URL_PAGINA}">Ir a la página Sistema Maestro</a>')
-
     return "\n".join(lineas)
 
 def enviar_telegram(mensaje, chat_id=None):
@@ -700,6 +627,186 @@ def _dividir_mensaje(mensaje, limite):
         partes.append(actual)
 
     return partes if partes else [mensaje[:limite]]
+
+# ========== MENÚ INTERACTIVO POR TELEGRAM (Departamento / Áreas) ==========
+
+# Guarda, por chat_id, en qué paso del menú está esa conversación:
+# {"tipo": "menu_principal" | "departamento_lista" | "area_lista", "opciones": [...]}
+lock_estados_menu = threading.Lock()
+estados_menu_chat = {}
+
+def obtener_areas_en_json():
+    plazas = cargar_datos_anteriores()
+    areas = set()
+    for p in plazas:
+        area = (p.get("area") or "").strip()
+        if area and area.lower() != "sin área":
+            areas.add(area)
+    return sorted(areas)
+
+def filtrar_plazas_por_departamento(nombre_departamento):
+    plazas = cargar_datos_anteriores()
+    return [p for p in plazas if (p.get("departamento") or "").strip() == nombre_departamento]
+
+def filtrar_plazas_por_area(nombre_area):
+    plazas = cargar_datos_anteriores()
+    return [p for p in plazas if (p.get("area") or "").strip() == nombre_area]
+
+def construir_resumen_filtrado(plazas_filtradas, encabezado=None):
+    """
+    Igual que construir_resumen, pero para un subconjunto ya filtrado
+    (por departamento o por área). El total mostrado es el del subconjunto,
+    no el total general del mapa.
+    """
+    total_hoy, total_ayer = contar_plazas_por_activacion(plazas_filtradas)
+
+    deptos = defaultdict(list)
+    for p in plazas_filtradas:
+        deptos[p["departamento"]].append(p)
+
+    lineas = []
+    lineas.append("🚨 <b>¡Plazas Sistema Maestro!</b> 🚨")
+    lineas.append("")
+    if encabezado:
+        lineas.append(f"🔎 <b>Filtro:</b> {html.escape(encabezado)}")
+    lineas.append(f"🌎 <b>Total plazas activas:</b> {len(plazas_filtradas)}")
+    lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy}")
+    lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer}")
+    lineas.append("")
+    lineas.append("--- <b>TODAS LAS PLAZAS</b> ---")
+    lineas.append("")
+
+    if not deptos:
+        lineas.append("No se encontraron plazas para este filtro.")
+    else:
+        for depto in sorted(deptos.keys()):
+            lineas.append(f"📌 <b>{html.escape(depto)}</b>")
+            for p in sorted(deptos[depto], key=lambda x: x["area"]):
+                area_esc = html.escape(p["area"])
+                municipio_esc = html.escape(p["municipio"])
+                lineas.append(f"  • {area_esc} ({municipio_esc}) – {p['postulados']} postulados")
+            lineas.append("")
+
+    lineas.append("")
+    lineas.append(f'🔗 <a href="{URL_PAGINA}">Ir a la página Sistema Maestro</a>')
+
+    return "\n".join(lineas)
+
+def _es_comando_menu(texto):
+    """
+    Determina si el texto equivale al comando "Menú" (con las mismas
+    tolerancias que _es_comando_actualizar: mayúsculas/minúsculas,
+    mención al bot, y forma de comando "/menu").
+    """
+    if not texto:
+        return False
+
+    texto = texto.strip()
+    mencion = f"@{TELEGRAM_BOT_USERNAME}"
+    texto_sin_mencion = texto.replace(mencion, "").strip()
+    candidato = texto_sin_mencion.lower()
+
+    return candidato in ("menu", "menú", "/menu", "/menú")
+
+def _enviar_menu_principal(chat_id):
+    with lock_estados_menu:
+        estados_menu_chat[chat_id] = {"tipo": "menu_principal"}
+    mensaje = (
+        "📋 <b>Menú principal</b>\n\n"
+        "1. Departamento\n"
+        "2. Áreas\n\n"
+        "Responde con el número de la opción."
+    )
+    enviar_telegram(mensaje, chat_id=chat_id)
+
+def _enviar_lista_departamentos(chat_id):
+    departamentos = obtener_departamentos_en_json()
+    if not departamentos:
+        enviar_telegram("No hay departamentos con plazas guardadas todavía.", chat_id=chat_id)
+        with lock_estados_menu:
+            estados_menu_chat.pop(chat_id, None)
+        return
+    with lock_estados_menu:
+        estados_menu_chat[chat_id] = {"tipo": "departamento_lista", "opciones": departamentos}
+    lineas = ["📍 <b>Elige un departamento:</b>", ""]
+    for i, nombre in enumerate(departamentos, start=1):
+        lineas.append(f"{i}. {nombre}")
+    lineas.append("")
+    lineas.append("Responde con el número.")
+    enviar_telegram("\n".join(lineas), chat_id=chat_id)
+
+def _enviar_lista_areas(chat_id):
+    areas = obtener_areas_en_json()
+    if not areas:
+        enviar_telegram("No hay áreas con plazas guardadas todavía.", chat_id=chat_id)
+        with lock_estados_menu:
+            estados_menu_chat.pop(chat_id, None)
+        return
+    with lock_estados_menu:
+        estados_menu_chat[chat_id] = {"tipo": "area_lista", "opciones": areas}
+    lineas = ["📚 <b>Elige un área:</b>", ""]
+    for i, nombre in enumerate(areas, start=1):
+        lineas.append(f"{i}. {nombre}")
+    lineas.append("")
+    lineas.append("Responde con el número.")
+    enviar_telegram("\n".join(lineas), chat_id=chat_id)
+
+def _procesar_seleccion_menu(chat_id, texto):
+    """
+    Si este chat tiene un menú pendiente (menú principal, lista de
+    departamentos o lista de áreas) y el texto recibido es un número,
+    procesa la selección y responde. Devuelve True si consumió el mensaje
+    como parte del flujo del menú; False si no había menú pendiente o el
+    texto no era una selección válida (para no interferir con otros
+    comandos, como "Actualizar").
+    """
+    with lock_estados_menu:
+        estado = estados_menu_chat.get(chat_id)
+
+    if not estado:
+        return False
+
+    texto_limpio = (texto or "").strip()
+    if not re.fullmatch(r"\d+", texto_limpio):
+        return False
+
+    seleccion = int(texto_limpio)
+    tipo = estado["tipo"]
+
+    if tipo == "menu_principal":
+        if seleccion == 1:
+            _enviar_lista_departamentos(chat_id)
+        elif seleccion == 2:
+            _enviar_lista_areas(chat_id)
+        else:
+            enviar_telegram("Opción inválida. Responde 1 o 2.", chat_id=chat_id)
+        return True
+
+    if tipo in ("departamento_lista", "area_lista"):
+        opciones = estado.get("opciones", [])
+        if not (1 <= seleccion <= len(opciones)):
+            enviar_telegram(
+                f"Opción inválida. Responde un número entre 1 y {len(opciones)}.",
+                chat_id=chat_id,
+            )
+            return True
+
+        nombre_elegido = opciones[seleccion - 1]
+        if tipo == "departamento_lista":
+            plazas_filtradas = filtrar_plazas_por_departamento(nombre_elegido)
+            mensaje = construir_resumen_filtrado(plazas_filtradas, encabezado=f"Departamento: {nombre_elegido}")
+        else:
+            plazas_filtradas = filtrar_plazas_por_area(nombre_elegido)
+            mensaje = construir_resumen_filtrado(plazas_filtradas, encabezado=f"Área: {nombre_elegido}")
+
+        enviar_telegram(mensaje, chat_id=chat_id)
+        with lock_estados_menu:
+            estados_menu_chat.pop(chat_id, None)
+        return True
+
+    with lock_estados_menu:
+        estados_menu_chat.pop(chat_id, None)
+    return False
 
 # ========== COMANDO "Actualizar" DESDE TELEGRAM (WEBHOOK) ==========
 
@@ -774,6 +881,13 @@ def telegram_webhook():
     texto = mensaje.get("text", "")
     chat = mensaje.get("chat", {})
     chat_id = chat.get("id")
+
+    if chat_id is not None and _es_comando_menu(texto):
+        _enviar_menu_principal(chat_id)
+        return {"ok": True}, 200
+
+    if chat_id is not None and _procesar_seleccion_menu(chat_id, texto):
+        return {"ok": True}, 200
 
     if chat_id is not None and _es_comando_actualizar(texto):
         threading.Thread(
