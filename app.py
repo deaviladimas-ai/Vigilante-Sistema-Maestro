@@ -374,6 +374,14 @@ def hilo_actualizador_postulados():
     print(f"🧵 Hilo actualizador de postulados iniciado (cada {INTERVALO_ACTUALIZACION_POSTULADOS}s).")
     while True:
         try:
+            # 🆕 Limpieza automática de plazas vencidas en cada ciclo
+            with lock_json:
+                plazas_bd = cargar_datos_anteriores()
+                vigentes, vencidas = limpiar_plazas_vencidas(plazas_bd)
+                if vencidas:
+                    guardar_datos_actuales(vigentes)
+                    print(f"🗑️ {len(vencidas)} plaza(s) vencida(s) eliminada(s) automáticamente.")
+
             departamentos = obtener_departamentos_en_json()
             if departamentos:
                 print(f"🔄 Refrescando postulados de {len(departamentos)} departamento(s): {', '.join(departamentos)}")
@@ -1152,7 +1160,7 @@ def home():
             }
 
             function actualizarContenidoJSON() {
-                fetch('/verjson')
+                fetch('/verjson', { cache: 'no-store' })   // 👈 evita respuesta cacheada
                     .then(response => response.json())
                     .then(data => {
                         const pre = document.querySelector('pre');
