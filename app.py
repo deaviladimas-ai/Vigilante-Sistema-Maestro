@@ -91,6 +91,13 @@ lock_ejecucion_vigilante = threading.Lock()
 # ============================================================
 
 def cargar_datos_anteriores():
+    with lock_json:
+        if os.path.exists(ARCHIVO_DATOS):
+            try:
+                with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return []
         return []
 
 def guardar_datos_actuales(plazas):
@@ -570,6 +577,73 @@ def contar_plazas_por_activacion(plazas):
     return contador_hoy, contador_ayer
 
 def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None, total_mapa_anterior=None):
+    """
+    Construye el mensaje para Telegram.
+    """
+    ids_nuevas = ids_nuevas or set()
+
+    total_hoy_json, total_ayer_calculado = contar_plazas_por_activacion(plazas_bd)
+
+    deptos = defaultdict(list)
+    for p in plazas_bd:
+        deptos[p["departamento"]].append(p)
+
+    lineas = []
+    lineas.append("🚨 <b>¡Plazas Sistema Maestro!</b> 🚨")
+    lineas.append("")
+
+    if total_mapa_anterior is not None:
+        diferencia = total_mapa - total_mapa_anterior
+        if diferencia > 0:
+            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>(+{diferencia})</b> ⬆️")
+        elif diferencia < 0:
+            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>({diferencia})</b> ⬇️")
+        else:
+            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} ↔️")
+    else:
+        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa}")
+
+    lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy_json}")
+    lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer_calculado}")
+
+    lineas.append("")
+    lineas.append("--- <b>TODAS LAS PLAZAS</b> ---")
+    lineas.append("")
+
+    plazas_anteriores = cargar_datos_anteriores()
+    anteriores_por_id = {p["id"]: p for p in plazas_anteriores}
+
+    for depto in sorted(deptos.keys()):
+        lineas.append(f"📌 <b>{html.escape(depto)}</b>")
+        for p in sorted(deptos[depto], key=lambda x: x["area"]):
+            es_nueva = p["id"] in ids_nuevas
+
+            cambio = None
+            if not es_nueva and p["id"] in anteriores_por_id:
+                anterior = anteriores_por_id[p["id"]]
+                if p["postulados"] != anterior["postulados"]:
+                    cambio = (anterior["postulados"], p["postulados"])
+
+            area_esc = html.escape(p["area"])
+            municipio_esc = html.escape(p["municipio"])
+
+            if es_nueva:
+                linea = f"  • {area_esc} ({municipio_esc}) 🆕 – {p['postulados']} postulados"
+            else:
+                flecha = ""
+                if cambio:
+                    if cambio[1] > cambio[0]:
+                        flecha = " ↑"
+                    elif cambio[1] < cambio[0]:
+                        flecha = " ↓"
+                linea = f"  • {area_esc} ({municipio_esc}){flecha} – {p['postulados']} postulados"
+
+            lineas.append(linea)
+        lineas.append("")
+
+    lineas.append("")
+    lineas.append(f'🔗 <a href="{URL_PAGINA}">Ir a la página Sistema Maestro</a>')
+
     return "\n".join(lineas)
 
 def enviar_telegram(mensaje, chat_id=None):
