@@ -91,21 +91,7 @@ lock_ejecucion_vigilante = threading.Lock()
 # ============================================================
 
 def cargar_datos_anteriores():
-    """Carga la lista de plazas guardada en ARCHIVO_DATOS.
-
-    FIX: antes esta función devolvía siempre [] sin importar lo que hubiera
-    en disco, lo que rompía toda la detección de cambios (cada corrida
-    creía que no había datos previos).
-    """
-    if os.path.exists(ARCHIVO_DATOS):
-        try:
-            with lock_json:
-                with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception as e:
-            print(f"⚠️ Error leyendo {ARCHIVO_DATOS}: {e}")
-            return []
-    return []
+        return []
 
 def guardar_datos_actuales(plazas):
     with lock_json:
@@ -584,54 +570,6 @@ def contar_plazas_por_activacion(plazas):
     return contador_hoy, contador_ayer
 
 def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None, total_mapa_anterior=None):
-    """
-    Arma el mensaje de resumen general enviado por Telegram cuando hay
-    cambios (plazas nuevas, postulados actualizados, o se fuerza la
-    notificación).
-
-    FIX: antes esta función terminaba en `return "\n".join(lineas)` sin
-    haber definido `lineas` en ningún lado, lo que producía un NameError
-    en cada notificación real (quedaba atrapado por el except de
-    ejecutar_vigilante y llegaba un mensaje de error en vez del resumen).
-    """
-    ids_nuevas = ids_nuevas or set()
-    total_hoy, total_ayer = contar_plazas_por_activacion(plazas_bd)
-
-    deptos = defaultdict(list)
-    for p in plazas_bd:
-        deptos[p["departamento"]].append(p)
-
-    lineas = []
-    lineas.append("🚨 <b>¡Plazas Sistema Maestro!</b> 🚨")
-    lineas.append("")
-    lineas.append(f"🌎 <b>Total plazas activas (JSON):</b> {len(plazas_bd)}")
-    lineas.append(f"🗺️ <b>Total plazas (mapa):</b> {total_mapa}")
-    if total_mapa_anterior is not None and total_mapa != total_mapa_anterior:
-        diff = total_mapa - total_mapa_anterior
-        signo = "+" if diff > 0 else ""
-        lineas.append(f"📊 <b>Cambio respecto al mapa anterior:</b> {signo}{diff}")
-    lineas.append(f"🆕 <b>Plazas nuevas detectadas:</b> {len(ids_nuevas)}")
-    lineas.append(f"📅 <b>Plazas activadas hoy:</b> {total_hoy}")
-    lineas.append(f"📆 <b>Plazas activadas ayer:</b> {total_ayer}")
-    lineas.append("")
-    lineas.append("--- <b>TODAS LAS PLAZAS</b> ---")
-    lineas.append("")
-
-    if not deptos:
-        lineas.append("No hay plazas registradas.")
-    else:
-        for depto in sorted(deptos.keys()):
-            lineas.append(f"📌 <b>{html.escape(depto)}</b>")
-            for p in sorted(deptos[depto], key=lambda x: x["area"]):
-                marca = "🆕 " if p["id"] in ids_nuevas else ""
-                area_esc = html.escape(p["area"])
-                municipio_esc = html.escape(p["municipio"])
-                lineas.append(f"  • {marca}{area_esc} ({municipio_esc}) – {p['postulados']} postulados")
-            lineas.append("")
-
-    lineas.append("")
-    lineas.append(f'🔗 <a href="{URL_PAGINA}">Ir a la página Sistema Maestro</a>')
-
     return "\n".join(lineas)
 
 def enviar_telegram(mensaje, chat_id=None):
@@ -1058,7 +996,6 @@ def home():
                     .then(response => response.json())
                     .then(data => {
                         document.getElementById('resultado').innerHTML = '✅ ' + data.resultado;
-                        actualizarContenidoJSON();
                     })
                     .catch(error => {
                         document.getElementById('resultado').innerHTML = '❌ Error: ' + error;
@@ -1071,7 +1008,6 @@ def home():
                     .then(response => response.json())
                     .then(data => {
                         document.getElementById('resultado').innerHTML = '✅ ' + data.resultado;
-                        actualizarContenidoJSON();
                     })
                     .catch(error => {
                         document.getElementById('resultado').innerHTML = '❌ Error: ' + error;
@@ -1152,15 +1088,6 @@ def home():
                     })
                     .catch(error => console.error('Error al actualizar JSON:', error));
             }
-
-            // Refresco automático del contenido del JSON en pantalla.
-            // El cron corre en el servidor cada minuto y puede cambiar los
-            // datos (plazas nuevas, postulados actualizados, plazas
-            // vencidas eliminadas) sin que la página lo sepa. Este
-            // intervalo mantiene la vista sincronizada mientras esté abierta,
-            // sin necesidad de recargar manualmente.
-            const INTERVALO_REFRESCO_MS = 30000; // 30 segundos
-            setInterval(actualizarContenidoJSON, INTERVALO_REFRESCO_MS);
 
             function agregarDepartamento(departamento) {
                 const confirmar = confirm(`¿Seguro que quieres agregar todas las plazas de "${departamento}" al JSON?`);
