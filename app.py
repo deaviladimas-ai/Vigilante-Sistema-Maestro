@@ -1163,6 +1163,15 @@ def home():
                     .catch(error => console.error('Error al actualizar JSON:', error));
             }
 
+            // Refresco automático del contenido del JSON en pantalla.
+            // El cron corre en el servidor cada minuto y puede cambiar los
+            // datos (plazas nuevas, postulados actualizados, plazas
+            // vencidas eliminadas) sin que la página lo sepa. Este
+            // intervalo mantiene la vista sincronizada mientras esté abierta,
+            // sin necesidad de recargar manualmente.
+            const INTERVALO_REFRESCO_MS = 30000; // 30 segundos
+            setInterval(actualizarContenidoJSON, INTERVALO_REFRESCO_MS);
+
             function agregarDepartamento(departamento) {
                 const confirmar = confirm(`¿Seguro que quieres agregar todas las plazas de "${departamento}" al JSON?`);
                 if (!confirmar) return;
