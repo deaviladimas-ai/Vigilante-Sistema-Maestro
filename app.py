@@ -3,6 +3,9 @@ import requests
 import os
 import re
 import json
+import html
+import threading
+import time
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from bs4 import BeautifulSoup
@@ -33,7 +36,8 @@ DEPARTAMENTOS_CODIGOS = {
     "antioquia": "05",        #confirmado
     "arauca": "81",
     "atlántico": "08",
-    "bogotá": "919",
+    "bogotá": "11",
+    "bogotá d.c": "11",
     "bolívar": "13",
     "boyacá": "15",
     "caldas": "17",
@@ -66,30 +70,59 @@ DEPARTAMENTOS_CODIGOS = {
 MAX_PAGINAS = 60
 FILAS_POR_PAGINA = 6
 
-# ============================================================
-# FUNCIONES ELIMINADAS (comentadas o simplemente no existen)
-# ============================================================
+# ========== HILO DE ACTUALIZACIÓN DE POSTULADOS EN SEGUNDO PLANO ==========
+INTERVALO_ACTUALIZACION_POSTULADOS = int(os.environ.get("INTERVALO_ACTUALIZACION_POSTULADOS", 600))
 
-# Carga manual de un JSON externo
-# --------------------------------------------------------
+# ========== HILO VIGILANTE AUTOMÁTICO (reemplaza al Cron Job externo) ==========
+# Antes esto dependía de un Cron Job de Render pegándole a /check cada minuto.
+# Si ese cron se desconfigura, cambia de URL, o el plan no lo soporta, dejas
+# de recibir notificaciones automáticas sin enterarte. Este hilo corre DENTRO
+# del propio proceso, así que mientras la app esté viva, se ejecuta solo.
+INTERVALO_VIGILANTE_SEGUNDOS = int(os.environ.get("INTERVALO_VIGILANTE_SEGUNDOS", 60))
+
+# Guarda info del último chequeo automático, útil para /status.
+estado_vigilante_automatico = {
+    "ultima_ejecucion": None,
+    "ultimo_resultado": None,
+    "ejecuciones": 0,
+}
+lock_estado_vigilante = threading.Lock()
+
+lock_json = threading.RLock()
+
+# Nombre del bot (para reconocer menciones tipo "@VigilanteSistemaMaestroBot Actualizar").
+TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "VigilanteSistemaMaestroBot")
+
+# Token secreto opcional para verificar que las peticiones al webhook realmente
+# vienen de Telegram (se configura al registrar el webhook, ver instrucciones
+# más abajo). Si no se define, no se valida (no recomendado en producción).
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+
+# Evita que dos "Actualizar" simultáneos disparen dos scrapeos completos a la vez.
+lock_ejecucion_vigilante = threading.Lock()
+
+# ============================================================
+# CARGA / GUARDADO DE DATOS
+# ============================================================
 
 def cargar_datos_anteriores():
-    if os.path.exists(ARCHIVO_DATOS):
-        try:
-            with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+    with lock_json:
+        if os.path.exists(ARCHIVO_DATOS):
+            try:
+                with open(ARCHIVO_DATOS, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
 
 def guardar_datos_actuales(plazas):
-    if plazas:
-        with open(ARCHIVO_DATOS, "w", encoding="utf-8") as f:
-            json.dump(plazas, f, ensure_ascii=False, indent=2)
-    else:
-        print("⚠️ Se intentó guardar una lista vacía de plazas. No se sobrescribió el archivo.")
+    with lock_json:
+        if plazas:
+            with open(ARCHIVO_DATOS, "w", encoding="utf-8") as f:
+                json.dump(plazas, f, ensure_ascii=False, indent=2)
+        else:
+            print("⚠️ Se intentó guardar una lista vacía de plazas. No se sobrescribió el archivo.")
 
-# También necesitamos obtener_total_plazas_mapa y guardar_total_mapa_actual para mantener consistencia
 def obtener_total_plazas_mapa():
     r = requests.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     r.raise_for_status()
@@ -101,8 +134,20 @@ def guardar_total_mapa_actual(total_mapa):
     with open(ARCHIVO_TOTAL_MAPA, "w", encoding="utf-8") as f:
         json.dump({"total_mapa": total_mapa}, f, ensure_ascii=False, indent=2)
 
-#De forma manual desde la interfaz web y automatica
-# --------------------------------------------------------
+def cargar_total_mapa_anterior():
+    """Carga el total de plazas del mapa guardado anteriormente"""
+    if os.path.exists(ARCHIVO_TOTAL_MAPA):
+        try:
+            with open(ARCHIVO_TOTAL_MAPA, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("total_mapa", 0)
+        except Exception:
+            return 0
+    return 0
+
+# ============================================================
+# SCRAPING
+# ============================================================
 
 def obtener_viewstate(session):
     r = session.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
@@ -192,11 +237,10 @@ def desambiguar_ids(vacantes):
 def cambiar_filtro_departamento(session, viewstate, codigo_departamento):
     """
     Simula el cambio del combo 'Departamento' del formulario de búsqueda.
-    Ahora usa form-busqueda:idInputDepartamento en lugar de idInputSecretaria.
     """
     data = {
         "javax.faces.partial.ajax": "true",
-        "javax.faces.source": "form-busqueda:idInputDepartamento",  # Cambio aquí
+        "javax.faces.source": "form-busqueda:idInputDepartamento",
         "javax.faces.partial.execute": "@all",
         "javax.faces.partial.render": "accordion",
         "javax.faces.behavior.event": "change",
@@ -204,9 +248,9 @@ def cambiar_filtro_departamento(session, viewstate, codigo_departamento):
         "form-busqueda": "form-busqueda",
         "javax.faces.ViewState": viewstate,
         "form-busqueda:idInputSecretaria_focus": "",
-        "form-busqueda:idInputSecretaria_input": "",          # Vacío
+        "form-busqueda:idInputSecretaria_input": "",
         "form-busqueda:idInputDepartamento_focus": "",
-        "form-busqueda:idInputDepartamento_input": codigo_departamento,  # Nuevo campo
+        "form-busqueda:idInputDepartamento_input": codigo_departamento,
         "form-busqueda:idInputEstablecimiento_filter": "",
         "form-busqueda:idInputArea_focus": "",
         "form-busqueda:idInputArea_input": "",
@@ -239,9 +283,9 @@ def pedir_pagina_filtrada(session, viewstate, first, rows, codigo_departamento):
         "form-busqueda": "form-busqueda",
         "javax.faces.ViewState": viewstate,
         "form-busqueda:idInputSecretaria_focus": "",
-        "form-busqueda:idInputSecretaria_input": "",          # Vacío
+        "form-busqueda:idInputSecretaria_input": "",
         "form-busqueda:idInputDepartamento_focus": "",
-        "form-busqueda:idInputDepartamento_input": codigo_departamento,  # Cambio
+        "form-busqueda:idInputDepartamento_input": codigo_departamento,
         "form-busqueda:idInputEstablecimiento_filter": "",
         "form-busqueda:idInputArea_focus": "",
         "form-busqueda:idInputArea_input": "",
@@ -265,7 +309,6 @@ def obtener_vacantes_por_departamento(nombre_departamento):
     nombre_clean = nombre_departamento.lower().strip()
     codigo = DEPARTAMENTOS_CODIGOS.get(nombre_clean)
     if not codigo:
-        # Búsqueda flexible
         for key, value in DEPARTAMENTOS_CODIGOS.items():
             if nombre_clean in key or key in nombre_clean:
                 codigo = value
@@ -278,10 +321,8 @@ def obtener_vacantes_por_departamento(nombre_departamento):
     if not viewstate:
         raise RuntimeError("No se pudo obtener el ViewState inicial")
 
-    # Aplicar filtro de departamento
     _, viewstate = cambiar_filtro_departamento(session, viewstate, codigo)
 
-    # Paginar resultados
     todas = []
     first = 0
     for _ in range(MAX_PAGINAS):
@@ -314,28 +355,93 @@ def obtener_departamentos_del_mapa():
 def fusionar_plazas(plazas_bd, plazas_scrapeadas):
     """
     Combina la base de datos persistente con lo que se scrapea.
-    - Plazas existentes: se actualizan (postulados, etc.)
-    - Plazas nuevas: se agregan
-    - Plazas que no aparecen hoy: se dejan intactas
     """
     bd_por_id = {p["id"]: dict(p) for p in plazas_bd}
     ids_nuevas = set()
     for p in plazas_scrapeadas:
         if p["id"] in bd_por_id:
-            # Actualizar datos de la plaza existente
             bd_por_id[p["id"]].update(p)
         else:
             bd_por_id[p["id"]] = dict(p)
             ids_nuevas.add(p["id"])
     return list(bd_por_id.values()), ids_nuevas
 
-#eliminar plaza
-#--------------
+# ========== HILO: REFRESCO DE POSTULADOS POR DEPARTAMENTO ==========
+
+def obtener_departamentos_en_json():
+    plazas = cargar_datos_anteriores()
+    departamentos = set()
+    for p in plazas:
+        depto = (p.get("departamento") or "").strip()
+        if depto and depto.lower() != "sin departamento":
+            departamentos.add(depto)
+    return sorted(departamentos)
+
+def actualizar_postulados_departamento(nombre_departamento):
+    plazas_scrapeadas = obtener_vacantes_por_departamento(nombre_departamento)
+    with lock_json:
+        plazas_bd = cargar_datos_anteriores()
+        plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, plazas_scrapeadas)
+        guardar_datos_actuales(plazas_bd)
+    return len(plazas_scrapeadas), len(ids_nuevas)
+
+def hilo_actualizador_postulados():
+    print(f"🧵 Hilo actualizador de postulados iniciado (cada {INTERVALO_ACTUALIZACION_POSTULADOS}s).")
+    while True:
+        try:
+            # 🆕 Limpieza automática de plazas vencidas en cada ciclo
+            with lock_json:
+                plazas_bd = cargar_datos_anteriores()
+                vigentes, vencidas = limpiar_plazas_vencidas(plazas_bd)
+                if vencidas:
+                    guardar_datos_actuales(vigentes)
+                    print(f"🗑️ {len(vencidas)} plaza(s) vencida(s) eliminada(s) automáticamente.")
+
+            departamentos = obtener_departamentos_en_json()
+            if departamentos:
+                print(f"🔄 Refrescando postulados de {len(departamentos)} departamento(s): {', '.join(departamentos)}")
+            for depto in departamentos:
+                try:
+                    encontradas, nuevas = actualizar_postulados_departamento(depto)
+                    print(f"   ✔ {depto}: {encontradas} plazas revisadas, {nuevas} nueva(s)")
+                except Exception as e:
+                    print(f"   ✘ Error actualizando postulados de '{depto}': {e}")
+        except Exception as e:
+            print(f"⚠️ Error en hilo actualizador de postulados: {e}")
+        time.sleep(INTERVALO_ACTUALIZACION_POSTULADOS)
+
+def hilo_vigilante_automatico():
+    """
+    Reemplaza al Cron Job externo: corre ejecutar_vigilante() cada
+    INTERVALO_VIGILANTE_SEGUNDOS (por defecto 60s) directamente dentro del
+    proceso de la app, sin depender de que algo de afuera llame a /check.
+    """
+    print(f"🧵 Hilo vigilante automático iniciado (cada {INTERVALO_VIGILANTE_SEGUNDOS}s).")
+    # Pequeña espera inicial para dejar que la app termine de levantar.
+    time.sleep(5)
+    while True:
+        adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
+        if not adquirido:
+            # Ya hay una ejecución en curso (p. ej. alguien escribió "Actualizar"
+            # justo en este momento); nos saltamos este ciclo.
+            time.sleep(INTERVALO_VIGILANTE_SEGUNDOS)
+            continue
+        try:
+            resultado = ejecutar_vigilante(notificar_siempre=False)
+            with lock_estado_vigilante:
+                estado_vigilante_automatico["ultima_ejecucion"] = datetime.now(ZONA_COLOMBIA).isoformat()
+                estado_vigilante_automatico["ultimo_resultado"] = resultado
+                estado_vigilante_automatico["ejecuciones"] += 1
+            print(f"🔍 Chequeo automático: {resultado}")
+        except Exception as e:
+            print(f"⚠️ Error en hilo vigilante automático: {e}")
+        finally:
+            lock_ejecucion_vigilante.release()
+        time.sleep(INTERVALO_VIGILANTE_SEGUNDOS)
+
+# ========== ELIMINAR PLAZAS VENCIDAS ==========
+
 def parsear_fecha_cierre(cierre_texto):
-    """
-    Convierte '01/08/2026 a las 11:30' a datetime con zona horaria de Colombia.
-    Devuelve None si el texto viene vacío o con formato inesperado.
-    """
     if not cierre_texto:
         return None
     try:
@@ -356,9 +462,9 @@ def limpiar_plazas_vencidas(plazas):
             vigentes.append(p)
     return vigentes, vencidas
 
-#--------------
+# ========== FLUJO PRINCIPAL ==========
 
-def ejecutar_vigilante(notificar_siempre=False):
+def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
     """
     Flujo principal automatizado:
     1. Limpiar plazas vencidas del JSON.
@@ -366,27 +472,25 @@ def ejecutar_vigilante(notificar_siempre=False):
     3. Si faltan plazas, agregar todas las pendientes por departamento.
     4. Detectar cambios (plazas nuevas, postulados que cambiaron).
     5. Notificar por Telegram (si hay cambios o si se fuerza).
+
+    chat_id: si se especifica (por ejemplo, cuando alguien escribe "Actualizar"
+    en el chat), el mensaje de resultado se envía a ESE chat en vez del
+    TELEGRAM_CHAT_ID configurado por defecto.
     """
     try:
-        # 1. Cargar JSON actual (base de datos)
         plazas_bd = cargar_datos_anteriores()
         total_json_actual = len(plazas_bd)
-
-        # Guardar copia ANTES de cualquier modificación (para detectar cambios)
         plazas_antes = plazas_bd.copy()
 
-        # 2. Limpiar plazas vencidas
         plazas_vigentes, plazas_vencidas = limpiar_plazas_vencidas(plazas_bd)
         if plazas_vencidas:
             guardar_datos_actuales(plazas_vigentes)
             plazas_bd = plazas_vigentes
             total_json_actual = len(plazas_bd)
 
-        # 3. Obtener total del mapa actual y el anterior (de total_mapa.json)
         total_mapa = obtener_total_plazas_mapa()
         total_mapa_anterior = cargar_total_mapa_anterior()
 
-        # 4. Si hay plazas faltantes, agregarlas automáticamente
         if total_mapa > total_json_actual:
             departamentos_pendientes = obtener_departamentos_pendientes()
             for depto in departamentos_pendientes:
@@ -396,14 +500,11 @@ def ejecutar_vigilante(notificar_siempre=False):
                     guardar_datos_actuales(plazas_bd)
                 except Exception as e:
                     print(f"Error agregando {depto}: {e}")
-            # Después de agregar, recargar plazas_bd y total_json_actual
             plazas_bd = cargar_datos_anteriores()
             total_json_actual = len(plazas_bd)
 
-        # 5. Detectar cambios comparando plazas_bd con plazas_antes
         cambios = detectar_cambios(plazas_bd, plazas_antes)
 
-        # 6. Determinar si notificar
         hay_cambios = (
             (total_mapa != total_mapa_anterior) or
             cambios["total_nuevas"] > 0 or
@@ -413,51 +514,34 @@ def ejecutar_vigilante(notificar_siempre=False):
         debe_notificar = hay_cambios or notificar_siempre
 
         if debe_notificar:
-            # Extraer IDs de plazas nuevas para el resumen
             ids_nuevas = {p["id"] for p in cambios["nuevas"]}
             resumen = construir_resumen(
                 plazas_bd,
-                plazas_bd,  # plazas_scrapeadas (usamos las mismas, pues ya están actualizadas)
+                plazas_bd,
                 total_mapa,
                 ids_nuevas,
                 total_mapa_anterior
             )
-            enviar_telegram(resumen)
-            # Guardar total del mapa actual para futuras comparaciones
+            enviar_telegram(resumen, chat_id=chat_id)
             guardar_total_mapa_actual(total_mapa)
             return "Notificación enviada."
         else:
-            # Actualizar total_mapa.json aunque no haya cambios (para mantener sincronía)
+            mensaje_sin_cambios = "✅ Vigilante ejecutado: no hay cambios nuevos respecto a la última revisión."
+            if chat_id is not None:
+                enviar_telegram(mensaje_sin_cambios, chat_id=chat_id)
             guardar_total_mapa_actual(total_mapa)
             return "Sin cambios notificables."
 
     except Exception as e:
-        enviar_telegram(f"⚠️ Error en vigilante: {str(e)[:200]}")
+        enviar_telegram(f"⚠️ Error en vigilante: {str(e)[:200]}", chat_id=chat_id)
         return f"Error: {str(e)[:100]}"
-
-def cargar_total_mapa_anterior():
-    """Carga el total de plazas del mapa guardado anteriormente"""
-    if os.path.exists(ARCHIVO_TOTAL_MAPA):
-        try:
-            with open(ARCHIVO_TOTAL_MAPA, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("total_mapa", 0)
-        except Exception:
-            return 0
-    return 0
-
-def guardar_total_mapa_actual(total_mapa):
-    with open(ARCHIVO_TOTAL_MAPA, "w", encoding="utf-8") as f:
-        json.dump({"total_mapa": total_mapa}, f, ensure_ascii=False, indent=2)
 
 def obtener_departamentos_pendientes():
     """
     Devuelve una lista con los nombres de los departamentos que tienen
     plazas en el mapa pero no están completas en el JSON.
     """
-    # Obtener departamentos del mapa
     deptos_mapa = obtener_departamentos_del_mapa()
-    # Cargar JSON y contar plazas por departamento
     plazas_json = cargar_datos_anteriores()
     contador_json = defaultdict(int)
     for p in plazas_json:
@@ -465,8 +549,6 @@ def obtener_departamentos_pendientes():
         if depto:
             contador_json[depto] += 1
 
-    # Obtener conteo por departamento desde el mapa
-    # (reutilizamos la lógica de /departamentos)
     r = requests.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     r.raise_for_status()
     patron = r'L\.marker\(\[.*?\],\s*\{[^}]*title:\s*[\'"]([^\'"]+)[\'"][^}]*\}\)'
@@ -521,7 +603,7 @@ def detectar_cambios(plazas_actuales, plazas_anteriores):
         "total_nuevas": len(nuevas),
         "total_actualizadas": len(actualizadas)
     }
-    
+
 def contar_plazas_por_activacion(plazas):
     """
     Recorre la lista de plazas y cuenta cuántas tienen su fecha de activación
@@ -545,21 +627,15 @@ def contar_plazas_por_activacion(plazas):
                 contador_ayer += 1
 
     return contador_hoy, contador_ayer
-    
+
 def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None, total_mapa_anterior=None):
     """
     Construye el mensaje para Telegram.
-    - plazas_bd: Todas las plazas en JSON (histórico completo)
-    - plazas_scrapeadas: Plazas de hoy (tabla) - en este flujo es igual a plazas_bd
-    - total_mapa: Total en el mapa
-    - ids_nuevas: IDs de plazas nuevas detectadas hoy
-    - total_mapa_anterior: Total del mapa en la ejecución anterior
     """
     ids_nuevas = ids_nuevas or set()
 
     total_hoy_json, total_ayer_calculado = contar_plazas_por_activacion(plazas_bd)
 
-    # Agrupar TODAS las plazas del JSON por departamento
     deptos = defaultdict(list)
     for p in plazas_bd:
         deptos[p["departamento"]].append(p)
@@ -567,7 +643,7 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
     lineas = []
     lineas.append("🚨 <b>¡Plazas Sistema Maestro!</b> 🚨")
     lineas.append("")
-    
+
     if total_mapa_anterior is not None:
         diferencia = total_mapa - total_mapa_anterior
         if diferencia > 0:
@@ -578,10 +654,10 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
             lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} ↔️")
     else:
         lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa}")
-    
+
     lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy_json}")
     lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer_calculado}")
-    
+
     lineas.append("")
     lineas.append("--- <b>TODAS LAS PLAZAS</b> ---")
     lineas.append("")
@@ -590,18 +666,21 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
     anteriores_por_id = {p["id"]: p for p in plazas_anteriores}
 
     for depto in sorted(deptos.keys()):
-        lineas.append(f"📌 <b>{depto}</b>")
+        lineas.append(f"📌 <b>{html.escape(depto)}</b>")
         for p in sorted(deptos[depto], key=lambda x: x["area"]):
             es_nueva = p["id"] in ids_nuevas
-            
+
             cambio = None
             if not es_nueva and p["id"] in anteriores_por_id:
                 anterior = anteriores_por_id[p["id"]]
                 if p["postulados"] != anterior["postulados"]:
                     cambio = (anterior["postulados"], p["postulados"])
-            
+
+            area_esc = html.escape(p["area"])
+            municipio_esc = html.escape(p["municipio"])
+
             if es_nueva:
-                linea = f"  • {p['area']} ({p['municipio']}) 🆕 – {p['postulados']} postulados"
+                linea = f"  • {area_esc} ({municipio_esc}) 🆕 – {p['postulados']} postulados"
             else:
                 flecha = ""
                 if cambio:
@@ -609,8 +688,8 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
                         flecha = " ↑"
                     elif cambio[1] < cambio[0]:
                         flecha = " ↓"
-                linea = f"  • {p['area']} ({p['municipio']}){flecha} – {p['postulados']} postulados"
-            
+                linea = f"  • {area_esc} ({municipio_esc}){flecha} – {p['postulados']} postulados"
+
             lineas.append(linea)
         lineas.append("")
 
@@ -619,15 +698,349 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
 
     return "\n".join(lineas)
 
-def enviar_telegram(mensaje):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    datos = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "HTML"}
-    try:
-        requests.post(url, data=datos, timeout=10)
-    except Exception as e:
-        print(f"Error Telegram: {e}")
+def enviar_telegram(mensaje, chat_id=None):
+    """
+    Envía un mensaje a Telegram, dividiéndolo en varias partes si supera
+    el límite de 4096 caracteres que impone la API de Telegram, y
+    registrando en logs cualquier error HTTP.
 
-# ========== ENDPOINTS DE DIAGNÓSTICO AGREGADOS ==========
+    chat_id: chat destino. Si no se especifica, se usa el TELEGRAM_CHAT_ID
+    configurado por defecto.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    LIMITE = 4000
+    destino = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
+
+    partes = _dividir_mensaje(mensaje, LIMITE)
+
+    for i, parte in enumerate(partes, start=1):
+        datos = {"chat_id": destino, "text": parte, "parse_mode": "HTML"}
+        try:
+            r = requests.post(url, data=datos, timeout=10)
+            if r.status_code != 200:
+                print(f"⚠️ Error Telegram (parte {i}/{len(partes)}): {r.status_code} - {r.text}")
+        except Exception as e:
+            print(f"⚠️ Error Telegram (parte {i}/{len(partes)}): {e}")
+
+def _dividir_mensaje(mensaje, limite):
+    """
+    Divide un mensaje largo en partes que no superen `limite` caracteres,
+    intentando cortar por líneas completas para no romper el HTML a la mitad.
+    """
+    lineas = mensaje.split("\n")
+    partes = []
+    actual = ""
+
+    for linea in lineas:
+        candidato = f"{actual}\n{linea}" if actual else linea
+
+        if len(candidato) <= limite:
+            actual = candidato
+            continue
+
+        if actual:
+            partes.append(actual)
+            actual = ""
+
+        if len(linea) <= limite:
+            actual = linea
+        else:
+            for i in range(0, len(linea), limite):
+                partes.append(linea[i:i + limite])
+            actual = ""
+
+    if actual:
+        partes.append(actual)
+
+    return partes if partes else [mensaje[:limite]]
+
+# ========== MENÚ INTERACTIVO POR TELEGRAM (Departamento / Áreas) ==========
+
+# Guarda, por chat_id, en qué paso del menú está esa conversación:
+# {"tipo": "menu_principal" | "departamento_lista" | "area_lista", "opciones": [...]}
+lock_estados_menu = threading.Lock()
+estados_menu_chat = {}
+
+def obtener_areas_en_json():
+    plazas = cargar_datos_anteriores()
+    areas = set()
+    for p in plazas:
+        area = (p.get("area") or "").strip()
+        if area and area.lower() != "sin área":
+            areas.add(area)
+    return sorted(areas)
+
+def filtrar_plazas_por_departamento(nombre_departamento):
+    plazas = cargar_datos_anteriores()
+    return [p for p in plazas if (p.get("departamento") or "").strip() == nombre_departamento]
+
+def filtrar_plazas_por_area(nombre_area):
+    plazas = cargar_datos_anteriores()
+    return [p for p in plazas if (p.get("area") or "").strip() == nombre_area]
+
+def construir_resumen_filtrado(plazas_filtradas, encabezado=None):
+    """
+    Igual que construir_resumen, pero para un subconjunto ya filtrado
+    (por departamento o por área). El total mostrado es el del subconjunto,
+    no el total general del mapa.
+    """
+    total_hoy, total_ayer = contar_plazas_por_activacion(plazas_filtradas)
+
+    deptos = defaultdict(list)
+    for p in plazas_filtradas:
+        deptos[p["departamento"]].append(p)
+
+    lineas = []
+    lineas.append("🚨 <b>¡Plazas Sistema Maestro!</b> 🚨")
+    lineas.append("")
+    if encabezado:
+        lineas.append(f"🔎 <b>Filtro:</b> {html.escape(encabezado)}")
+    lineas.append(f"🌎 <b>Total plazas activas:</b> {len(plazas_filtradas)}")
+    lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy}")
+    lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer}")
+    lineas.append("")
+    lineas.append("--- <b>TODAS LAS PLAZAS</b> ---")
+    lineas.append("")
+
+    if not deptos:
+        lineas.append("No se encontraron plazas para este filtro.")
+    else:
+        for depto in sorted(deptos.keys()):
+            lineas.append(f"📌 <b>{html.escape(depto)}</b>")
+            for p in sorted(deptos[depto], key=lambda x: x["area"]):
+                area_esc = html.escape(p["area"])
+                municipio_esc = html.escape(p["municipio"])
+                lineas.append(f"  • {area_esc} ({municipio_esc}) – {p['postulados']} postulados")
+            lineas.append("")
+
+    lineas.append("")
+    lineas.append(f'🔗 <a href="{URL_PAGINA}">Ir a la página Sistema Maestro</a>')
+
+    return "\n".join(lineas)
+
+def _es_comando_menu(texto):
+    """
+    Determina si el texto equivale al comando "Menú" (con las mismas
+    tolerancias que _es_comando_actualizar: mayúsculas/minúsculas,
+    mención al bot, y forma de comando "/menu").
+    """
+    if not texto:
+        return False
+
+    texto = texto.strip()
+    mencion = f"@{TELEGRAM_BOT_USERNAME}"
+    texto_sin_mencion = texto.replace(mencion, "").strip()
+    candidato = texto_sin_mencion.lower()
+
+    return candidato in ("menu", "menú", "/menu", "/menú")
+
+def _enviar_menu_principal(chat_id):
+    with lock_estados_menu:
+        estados_menu_chat[chat_id] = {"tipo": "menu_principal"}
+    mensaje = (
+        "📋 <b>Menú principal</b>\n\n"
+        "1. Departamento\n"
+        "2. Áreas\n\n"
+        "Responde con el número de la opción."
+    )
+    enviar_telegram(mensaje, chat_id=chat_id)
+
+def _enviar_lista_departamentos(chat_id):
+    departamentos = obtener_departamentos_en_json()
+    if not departamentos:
+        enviar_telegram("No hay departamentos con plazas guardadas todavía.", chat_id=chat_id)
+        with lock_estados_menu:
+            estados_menu_chat.pop(chat_id, None)
+        return
+    with lock_estados_menu:
+        estados_menu_chat[chat_id] = {"tipo": "departamento_lista", "opciones": departamentos}
+    lineas = ["📍 <b>Elige un departamento:</b>", ""]
+    for i, nombre in enumerate(departamentos, start=1):
+        lineas.append(f"{i}. {nombre}")
+    lineas.append("")
+    lineas.append("Responde con el número.")
+    enviar_telegram("\n".join(lineas), chat_id=chat_id)
+
+def _enviar_lista_areas(chat_id):
+    areas = obtener_areas_en_json()
+    if not areas:
+        enviar_telegram("No hay áreas con plazas guardadas todavía.", chat_id=chat_id)
+        with lock_estados_menu:
+            estados_menu_chat.pop(chat_id, None)
+        return
+    with lock_estados_menu:
+        estados_menu_chat[chat_id] = {"tipo": "area_lista", "opciones": areas}
+    lineas = ["📚 <b>Elige un área:</b>", ""]
+    for i, nombre in enumerate(areas, start=1):
+        lineas.append(f"{i}. {nombre}")
+    lineas.append("")
+    lineas.append("Responde con el número.")
+    enviar_telegram("\n".join(lineas), chat_id=chat_id)
+
+def _procesar_seleccion_menu(chat_id, texto):
+    """
+    Si este chat tiene un menú pendiente (menú principal, lista de
+    departamentos o lista de áreas) y el texto recibido es un número,
+    procesa la selección y responde. Devuelve True si consumió el mensaje
+    como parte del flujo del menú; False si no había menú pendiente o el
+    texto no era una selección válida (para no interferir con otros
+    comandos, como "Actualizar").
+    """
+    with lock_estados_menu:
+        estado = estados_menu_chat.get(chat_id)
+
+    if not estado:
+        return False
+
+    texto_limpio = (texto or "").strip()
+    if not re.fullmatch(r"\d+", texto_limpio):
+        return False
+
+    seleccion = int(texto_limpio)
+    tipo = estado["tipo"]
+
+    if tipo == "menu_principal":
+        if seleccion == 1:
+            _enviar_lista_departamentos(chat_id)
+        elif seleccion == 2:
+            _enviar_lista_areas(chat_id)
+        else:
+            enviar_telegram("Opción inválida. Responde 1 o 2.", chat_id=chat_id)
+        return True
+
+    if tipo in ("departamento_lista", "area_lista"):
+        opciones = estado.get("opciones", [])
+        if not (1 <= seleccion <= len(opciones)):
+            enviar_telegram(
+                f"Opción inválida. Responde un número entre 1 y {len(opciones)}.",
+                chat_id=chat_id,
+            )
+            return True
+
+        nombre_elegido = opciones[seleccion - 1]
+        if tipo == "departamento_lista":
+            plazas_filtradas = filtrar_plazas_por_departamento(nombre_elegido)
+            mensaje = construir_resumen_filtrado(plazas_filtradas, encabezado=f"Departamento: {nombre_elegido}")
+        else:
+            plazas_filtradas = filtrar_plazas_por_area(nombre_elegido)
+            mensaje = construir_resumen_filtrado(plazas_filtradas, encabezado=f"Área: {nombre_elegido}")
+
+        enviar_telegram(mensaje, chat_id=chat_id)
+        with lock_estados_menu:
+            estados_menu_chat.pop(chat_id, None)
+        return True
+
+    with lock_estados_menu:
+        estados_menu_chat.pop(chat_id, None)
+    return False
+
+# ========== COMANDO "Actualizar" DESDE TELEGRAM (WEBHOOK) ==========
+
+def _es_comando_actualizar(texto):
+    """
+    Determina si el texto de un mensaje de Telegram equivale al comando
+    "Actualizar", tolerando:
+      - Mayúsculas/minúsculas ("actualizar", "ACTUALIZAR", "Actualizar")
+      - Mención al bot delante ("@VigilanteSistemaMaestroBot Actualizar")
+      - Forma de comando ("/actualizar", "/actualizar@VigilanteSistemaMaestroBot")
+    """
+    if not texto:
+        return False
+
+    texto = texto.strip()
+
+    mencion = f"@{TELEGRAM_BOT_USERNAME}"
+    texto_sin_mencion = texto.replace(mencion, "").strip()
+
+    candidato = texto_sin_mencion.lower()
+
+    if candidato in ("actualizar", "/actualizar"):
+        return True
+
+    return False
+
+def _procesar_comando_actualizar(chat_id):
+    """
+    Se ejecuta en un hilo aparte (para no bloquear la respuesta al webhook
+    de Telegram, que espera un 200 OK rápido). Corre ejecutar_vigilante()
+    forzando notificación y respondiendo al chat que escribió "Actualizar".
+    """
+    adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
+    if not adquirido:
+        enviar_telegram(
+            "⏳ Ya hay una actualización en curso. Te aviso cuando termine esa.",
+            chat_id=chat_id,
+        )
+        return
+
+    try:
+        enviar_telegram("🔎 Actualizando plazas, dame un momento...", chat_id=chat_id)
+        ejecutar_vigilante(notificar_siempre=True, chat_id=chat_id)
+    except Exception as e:
+        enviar_telegram(f"⚠️ Error al actualizar: {str(e)[:200]}", chat_id=chat_id)
+    finally:
+        lock_ejecucion_vigilante.release()
+
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    """
+    Endpoint que Telegram llama cada vez que hay un mensaje nuevo en un chat
+    donde está el bot (una vez configurado el webhook, ver instrucciones al
+    final del archivo).
+
+    Si el texto del mensaje es "Actualizar" (con las variantes toleradas en
+    _es_comando_actualizar) -- venga de CUALQUIER usuario/chat -- dispara
+    ejecutar_vigilante() en un hilo aparte y responde de inmediato 200 OK a
+    Telegram para no generar timeouts.
+    """
+    if TELEGRAM_WEBHOOK_SECRET:
+        secreto_recibido = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secreto_recibido != TELEGRAM_WEBHOOK_SECRET:
+            return {"ok": False}, 403
+
+    try:
+        update = request.get_json(silent=True) or {}
+    except Exception:
+        update = {}
+
+    mensaje = update.get("message") or update.get("edited_message") or {}
+    texto = mensaje.get("text", "")
+    chat = mensaje.get("chat", {})
+    chat_id = chat.get("id")
+
+    if chat_id is not None and _es_comando_menu(texto):
+        _enviar_menu_principal(chat_id)
+        return {"ok": True}, 200
+
+    if chat_id is not None and _procesar_seleccion_menu(chat_id, texto):
+        return {"ok": True}, 200
+
+    if chat_id is not None and _es_comando_actualizar(texto):
+        threading.Thread(
+            target=_procesar_comando_actualizar,
+            args=(chat_id,),
+            daemon=True,
+        ).start()
+
+    return {"ok": True}, 200
+
+@app.route("/set-webhook")
+def set_webhook():
+    """
+    Endpoint de conveniencia: registra la URL pública de este servicio como
+    webhook de Telegram, para no tener que llamar la API a mano con curl.
+    Visítala UNA VEZ desde el navegador después de desplegar
+    (ej: https://tu-app.onrender.com/set-webhook).
+    """
+    url_publica = request.host_url.rstrip("/") + "/telegram-webhook"
+    url_api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    try:
+        r = requests.post(url_api, data={"url": url_publica}, timeout=10)
+        return {"webhook_configurado": url_publica, "respuesta_telegram": r.json()}
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+# ========== ENDPOINTS DE DIAGNÓSTICO ==========
 
 @app.route("/check")
 def check():
@@ -639,6 +1052,20 @@ def check_force():
     resultado = ejecutar_vigilante(notificar_siempre=True)
     return {"resultado": resultado}
 
+@app.route("/status")
+def status():
+    """
+    Endpoint rápido para confirmar que el hilo vigilante automático sigue
+    vivo y ver cuándo fue su última ejecución, sin tener que mirar logs.
+    """
+    with lock_estado_vigilante:
+        return {
+            "intervalo_segundos": INTERVALO_VIGILANTE_SEGUNDOS,
+            "ultima_ejecucion": estado_vigilante_automatico["ultima_ejecucion"],
+            "ultimo_resultado": estado_vigilante_automatico["ultimo_resultado"],
+            "ejecuciones_desde_arranque": estado_vigilante_automatico["ejecuciones"],
+        }
+
 @app.route("/")
 def home():
     ruta = os.path.abspath(ARCHIVO_DATOS)
@@ -647,7 +1074,7 @@ def home():
         with open(ruta, "r", encoding="utf-8") as f:
             contenido = json.load(f)
 
-    html = """
+    html_page = """
     <!DOCTYPE html>
     <html>
     <head>
@@ -725,7 +1152,7 @@ def home():
                     .catch(error => {
                         document.getElementById('resultado').innerHTML = '❌ Error: ' + error;
                     });
-            }            
+            }
 
             function verDepartamentos() {
                 const card = document.getElementById('departamentos-card');
@@ -791,7 +1218,7 @@ def home():
             }
 
             function actualizarContenidoJSON() {
-                fetch('/verjson')
+                fetch('/verjson', { cache: 'no-store' })   // 👈 evita respuesta cacheada
                     .then(response => response.json())
                     .then(data => {
                         const pre = document.querySelector('pre');
@@ -801,6 +1228,15 @@ def home():
                     })
                     .catch(error => console.error('Error al actualizar JSON:', error));
             }
+
+            // Refresco automático del contenido del JSON en pantalla.
+            // El vigilante corre en el servidor cada minuto y puede cambiar los
+            // datos (plazas nuevas, postulados actualizados, plazas
+            // vencidas eliminadas) sin que la página lo sepa. Este
+            // intervalo mantiene la vista sincronizada mientras esté abierta,
+            // sin necesidad de recargar manualmente.
+            const INTERVALO_REFRESCO_MS = 30000; // 30 segundos
+            setInterval(actualizarContenidoJSON, INTERVALO_REFRESCO_MS);
 
             function agregarDepartamento(departamento) {
                 const confirmar = confirm(`¿Seguro que quieres agregar todas las plazas de "${departamento}" al JSON?`);
@@ -822,9 +1258,7 @@ def home():
                     } else {
                         resultadoDiv.innerHTML = `✅ ${data.mensaje} (Total en JSON: ${data.total_plazas_en_json})`;
                         alert(`✅ ${data.mensaje}\\nEncontradas: ${data.plazas_encontradas}\\nNuevas agregadas: ${data.plazas_nuevas}`);
-                        // Refrescar la tabla de departamentos
                         verDepartamentos();
-                        // Refrescar el contenido del JSON en el <pre>
                         actualizarContenidoJSON();
                     }
                 })
@@ -838,7 +1272,7 @@ def home():
                 if (confirm('⚠️ ¿Estás seguro de que quieres ELIMINAR TODOS los datos guardados? Esta acción no se puede deshacer.')) {
                     const resultadoDiv = document.getElementById('resultado');
                     resultadoDiv.innerHTML = '⏳ Eliminando datos...';
-                    
+
                     fetch('/limpiar-json', { method: 'POST' })
                         .then(response => response.json())
                         .then(data => {
@@ -857,7 +1291,7 @@ def home():
                         });
                 }
             }
-        
+
             function agregarTodosLosDepartamentos() {
                 const confirmar = confirm('⚠️ ¿Seguro que quieres agregar todas las plazas de TODOS los departamentos pendientes?');
                 if (!confirmar) return;
@@ -869,7 +1303,6 @@ def home():
                 const resultadoDiv = document.getElementById('resultado');
                 resultadoDiv.innerHTML = '⏳ Obteniendo lista de departamentos...';
 
-                // Paso 1: Obtener la lista de departamentos
                 fetch('/departamentos')
                     .then(response => response.json())
                     .then(data => {
@@ -881,9 +1314,8 @@ def home():
                             return;
                         }
 
-                        // Filtrar departamentos que necesitan ser agregados (en_json < cantidad)
                         const pendientes = data.departamentos.filter(d => d.en_json < d.cantidad);
-                        
+
                         if (pendientes.length === 0) {
                             resultadoDiv.innerHTML = '✅ Todos los departamentos ya están completos. ¡No hay nada que agregar!';
                             alert('✅ Todos los departamentos ya están completos.');
@@ -892,21 +1324,17 @@ def home():
                             return;
                         }
 
-                        // Mostrar cuántos departamentos vamos a procesar
                         resultadoDiv.innerHTML = `⏳ Agregando plazas de ${pendientes.length} departamento(s) pendientes... (0/${pendientes.length})`;
-                        
-                        // Paso 2: Procesar cada departamento pendiente en secuencia
+
                         let procesados = 0;
                         let totalAgregados = 0;
                         let errores = [];
 
                         function procesarSiguiente() {
                             if (procesados >= pendientes.length) {
-                                // Todos procesados
                                 const mensaje = `✅ Proceso completado. Se agregaron plazas de ${totalAgregados} departamento(s). ${errores.length > 0 ? 'Hubo ' + errores.length + ' error(es).' : ''}`;
                                 resultadoDiv.innerHTML = mensaje;
                                 alert(mensaje);
-                                // Refrescar la tabla y el JSON para ver los cambios
                                 verDepartamentos();
                                 actualizarContenidoJSON();
                                 btn.disabled = false;
@@ -918,7 +1346,6 @@ def home():
                             const nombre = depto.nombre;
                             resultadoDiv.innerHTML = `⏳ Agregando plazas de ${nombre}... (${procesados + 1}/${pendientes.length})`;
 
-                            // Llamar a agregarDepartamento (pero sin confirmación y sin alertas)
                             fetch('/agregar-departamento', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
@@ -941,7 +1368,6 @@ def home():
                             });
                         }
 
-                        // Iniciar el procesamiento secuencial
                         procesarSiguiente();
 
                     })
@@ -971,7 +1397,6 @@ def home():
                     } else {
                         resultadoDiv.innerHTML = `✅ ${data.mensaje} (Restantes: ${data.restantes || 0})`;
                         alert(`✅ ${data.mensaje}`);
-                        // Refrescar la tabla de departamentos y el JSON mostrado
                         verDepartamentos();
                         actualizarContenidoJSON();
                     }
@@ -1014,11 +1439,11 @@ def home():
     </body>
     </html>
     """
-    html = html.replace(
+    html_page = html_page.replace(
         "__CONTENIDO_JSON__",
         json.dumps(contenido, indent=2, ensure_ascii=False)
     )
-    return html
+    return html_page
 
 @app.route("/limpiar-json", methods=["POST"])
 def limpiar_json():
@@ -1060,16 +1485,13 @@ def cargar_json():
     if not data:
         return {"error": "El JSON está vacío (lista vacía)"}, 400
 
-    # Guardar los datos
     guardar_datos_actuales(data)
-    # También guardar el total del mapa actual
     try:
         total_mapa = obtener_total_plazas_mapa()
         guardar_total_mapa_actual(total_mapa)
     except Exception as e:
-        # Si falla, no es crítico, pero lo registramos
         print(f"Error al obtener total del mapa: {e}")
-    
+
     return {"mensaje": f"✅ JSON guardado correctamente ({len(data)} plazas)"}
 
 @app.route("/verjson")
@@ -1089,12 +1511,10 @@ def obtener_departamentos():
     - en_json: plazas ya guardadas en el JSON para ese departamento
     """
     try:
-        from collections import Counter
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(URL_PAGINA, headers=headers, timeout=30)
         response.raise_for_status()
 
-        # Extraer títulos de marcadores (departamentos con plazas)
         patron = r'L\.marker\(\[.*?\],\s*\{[^}]*title:\s*[\'"]([^\'"]+)[\'"][^}]*\}\)'
         coincidencias = re.findall(patron, response.text, re.DOTALL)
         if not coincidencias:
@@ -1104,10 +1524,8 @@ def obtener_departamentos():
         if not coincidencias:
             return {"error": "No se encontraron departamentos"}, 404
 
-        # Contar plazas por departamento en el mapa
         contador_mapa = Counter(coincidencias)
 
-        # Cargar el JSON actual y contar plazas por departamento
         plazas_json = cargar_datos_anteriores()
         contador_json = defaultdict(int)
         for p in plazas_json:
@@ -1115,10 +1533,8 @@ def obtener_departamentos():
             if depto:
                 contador_json[depto] += 1
 
-        # Construir la lista combinada
         departamentos = []
         for nombre, cantidad_mapa in contador_mapa.items():
-            # Extraer solo el nombre del departamento (primera parte antes de " - ")
             nombre_depto = nombre.split(" - ")[0].strip()
             cantidad_json = contador_json.get(nombre_depto, 0)
             departamentos.append({
@@ -1127,7 +1543,6 @@ def obtener_departamentos():
                 "en_json": cantidad_json
             })
 
-        # Ordenar por cantidad (de mayor a menor)
         departamentos.sort(key=lambda x: x["cantidad"], reverse=True)
 
         return {
@@ -1153,7 +1568,6 @@ def agregar_departamento():
 
         departamento_nombre = data["departamento"].strip()
 
-        # Obtener plazas del departamento
         try:
             plazas_departamento = obtener_vacantes_por_departamento(departamento_nombre)
         except ValueError as e:
@@ -1162,12 +1576,10 @@ def agregar_departamento():
         if not plazas_departamento:
             return {"error": f"No se encontraron plazas para '{departamento_nombre}'."}, 404
 
-        # Cargar JSON anterior y fusionar
         plazas_bd = cargar_datos_anteriores()
         plazas_fusionadas, ids_nuevas = fusionar_plazas(plazas_bd, plazas_departamento)
         guardar_datos_actuales(plazas_fusionadas)
 
-        # Actualizar también el total del mapa (para mantener consistencia)
         try:
             total_mapa = obtener_total_plazas_mapa()
             guardar_total_mapa_actual(total_mapa)
@@ -1194,9 +1606,6 @@ def limpiar_vencidas():
         vigentes, vencidas = limpiar_plazas_vencidas(plazas)
         if vencidas:
             guardar_datos_actuales(vigentes)
-            # Opcional: actualizar total_mapa.json con el nuevo conteo (si quieres)
-            # total_mapa = obtener_total_plazas_mapa()
-            # guardar_total_mapa_actual(total_mapa)
             return {
                 "mensaje": f"Se eliminaron {len(vencidas)} plazas vencidas.",
                 "eliminadas": len(vencidas),
@@ -1206,6 +1615,66 @@ def limpiar_vencidas():
             return {"mensaje": "No hay plazas vencidas.", "eliminadas": 0}, 200
     except Exception as e:
         return {"error": str(e)}, 500
+
+# Arranca al importar el módulo (no solo dentro de __main__) para que
+# también funcione cuando Render lo despliega con Gunicorn (gunicorn app:app).
+# ⚠️ Si usas más de 1 worker de Gunicorn, estos hilos arrancan UNA VEZ POR
+# WORKER y terminarás scrapeando / notificando el mismo departamento varias
+# veces en paralelo. Con Render, usa un solo worker
+# (gunicorn app:app --workers 1) o mueve esta tarea a un Background
+# Worker/Cron Job aparte.
+threading.Thread(target=hilo_actualizador_postulados, daemon=True).start()
+threading.Thread(target=hilo_vigilante_automatico, daemon=True).start()
+
+# ============================================================
+# CÓMO ACTIVAR EL COMANDO "Actualizar" (WEBHOOK DE TELEGRAM)
+# ============================================================
+# Telegram necesita saber a qué URL avisarte cada vez que alguien escribe en
+# el chat. Esto se configura UNA SOLA VEZ (no en cada arranque de la app),
+# llamando a la API de Telegram desde tu navegador, curl, o Postman -- o
+# simplemente visitando /set-webhook una vez desplegada la app:
+#
+#   https://<TU_APP>.onrender.com/set-webhook
+#
+# Opcional pero recomendado (evita que cualquiera golpee tu endpoint):
+# define la variable de entorno TELEGRAM_WEBHOOK_SECRET con un valor
+# aleatorio antes de desplegar.
+#
+# Para que el bot reaccione a "Actualizar" (sin "/") escrito en GRUPOS,
+# hay que desactivar su modo privado en @BotFather:
+#   /setprivacy -> selecciona el bot -> Disable
+# En chats privados 1 a 1 con el bot esto no es necesario.
+#
+# Para verificar que el webhook quedó bien configurado:
+#
+#   https://api.telegram.org/bot<TOKEN>/getWebhookInfo
+#
+# Una vez hecho esto, cualquier persona en el chat puede escribir
+# "Actualizar" (o "@VigilanteSistemaMaestroBot Actualizar" en un grupo, o
+# "/actualizar") y el bot ejecutará ejecutar_vigilante() y responderá en
+# ese mismo chat con el resumen de plazas.
+#
+# ============================================================
+# CHEQUEO AUTOMÁTICO CADA MINUTO (NUEVO)
+# ============================================================
+# Ya NO depende de un Cron Job externo de Render. El hilo
+# hilo_vigilante_automatico() corre dentro del propio proceso y llama a
+# ejecutar_vigilante() cada INTERVALO_VIGILANTE_SEGUNDOS (60s por defecto).
+# Puedes cambiar ese intervalo con la variable de entorno
+# INTERVALO_VIGILANTE_SEGUNDOS sin tocar el código.
+#
+# Para confirmar que sigue vivo, visita:
+#   https://<TU_APP>.onrender.com/status
+#
+# ⚠️ Si usas el plan gratuito de Render, el servicio se "duerme" tras un
+# rato sin recibir peticiones HTTP externas, y este hilo se detiene con él.
+# En ese caso sigue necesitando algo externo (p. ej. un ping gratuito de
+# UptimeRobot cada 5 min a la URL raíz "/") solo para mantener el proceso
+# despierto -- ya no hace falta que ese ping le pegue específicamente a
+# /check, porque el hilo interno se encarga de eso mientras el proceso
+# esté vivo. Si estás en un plan "always on", no necesitas ningún ping
+# externo.
+# ============================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
