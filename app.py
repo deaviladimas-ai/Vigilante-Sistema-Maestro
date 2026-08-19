@@ -67,6 +67,58 @@ DEPARTAMENTOS_CODIGOS = {
     "vaupés": "97",
     "vichada": "99",
 }
+
+# ========== ABREVIATURAS DE ÁREAS ==========
+AREA_ABREVIATURAS = {
+    # Caso especial (sin asignación)
+    "sin asignación directa": "Sin Asignación",
+
+    # Ciencias
+    "ciencias económicas y políticas": "C. Económicas",
+    "ciencias naturales física": "C. Naturales (Física)",
+    "ciencias naturales química": "C. Naturales (Química)",
+    "ciencias naturales y educación ambiental": "C. Naturales",
+    "ciencias sociales": "C. Sociales",
+
+    # Educación artística
+    "educación artística - artes escénicas": "Artes Escénicas",
+    "educación artística - artes plásticas": "Artes Plásticas",
+    "educación artística – danzas": "Danzas",
+    "educación artística – música": "Música",
+
+    # Educación artística (programa PTA)
+    "educación artística - danzas (programa pta)": "Danzas (PTA)",
+    "educación artística - literatura (programa pta)": "Literatura (PTA)",
+    "educación artística - música (programa pta)": "Música (PTA)",
+
+    # Otras áreas
+    "educación ética y en valores": "Ética y Valores",
+    "educación física, recreación y deporte": "Ed. Física",
+    "educación religiosa": "Religión",
+    "filosofía": "Filosofía",
+    "humanidades y lengua castellana": "Lengua Castellana",
+    "idioma extranjero inglés": "Inglés",
+    "matemáticas": "Matemáticas",
+    "tecnología e informática": "Tecnología",
+
+    # Áreas de apoyo y niveles educativos
+    "áreas de apoyo para educación especial": "Apoyo Ed. Especial",
+    "orientadores": "Orientadores",
+    "preescolar": "Preescolar",
+    "primaria": "Primaria",
+}
+
+def abreviar_area(area):
+    """
+    Devuelve la versión corta de un nombre de área según el diccionario.
+    Si no está en el diccionario, devuelve el nombre original.
+    """
+    if not area:
+        return "Sin área"
+    area_lower = area.lower().strip()
+    return AREA_ABREVIATURAS.get(area_lower, area)
+
+
 MAX_PAGINAS = 60
 FILAS_POR_PAGINA = 6
 
@@ -608,7 +660,7 @@ def construir_resumen_completo(plazas_actuales, plazas_anteriores, total_mapa, c
     for depto in sorted(deptos.keys()):
         lineas.append(f"📌 <b>{html.escape(depto)}</b>")
         for p in sorted(deptos[depto], key=lambda x: x["area"]):
-            area_esc = html.escape(p["area"])
+            area_esc = html.escape(abreviar_area(p["area"]))
             municipio_esc = html.escape(p["municipio"])
             # Indicar si es nueva (aunque ya esté en la sección de cambios, lo ponemos aquí también)
             es_nueva = p["id"] in [n["id"] for n in cambios["nuevas"]]
@@ -805,7 +857,7 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
                 if p["postulados"] != anterior["postulados"]:
                     cambio = (anterior["postulados"], p["postulados"])
 
-            area_esc = html.escape(p["area"])
+            area_esc = html.escape(abreviar_area(p["area"]))
             municipio_esc = html.escape(p["municipio"])
 
             if es_nueva:
@@ -937,7 +989,7 @@ def construir_resumen_filtrado(plazas_filtradas, encabezado=None):
         for depto in sorted(deptos.keys()):
             lineas.append(f"📌 <b>{html.escape(depto)}</b>")
             for p in sorted(deptos[depto], key=lambda x: x["area"]):
-                area_esc = html.escape(p["area"])
+                area_esc = html.escape(abreviar_area(p["area"]))
                 municipio_esc = html.escape(p["municipio"])
                 lineas.append(f"  • {area_esc} ({municipio_esc}) – {p['postulados']} postulados")
             lineas.append("")
