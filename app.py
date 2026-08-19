@@ -253,18 +253,24 @@ def parsear_vacantes(html_fragmento):
         cierre = re.sub(r"\s+", " ", cierre).strip() if cierre else ""
         area = extraer_campo(panel, r"Área:")
         secretaria = extraer_campo(panel, r"Secretaría de Educación:")
-        zona = extraer_campo(panel, r"Zona:")
+
+        # Extraer zonas (hay dos)
+        zonas = panel.find_all("label", string=re.compile(r"Zona:"))
+        zona_geografica = zonas[0].get_text(strip=True).replace("Zona:", "").strip() if zonas else "Sin zona"
+        zona_tipo = zonas[1].get_text(strip=True).replace("Zona:", "").strip() if len(zonas) > 1 else "Sin tipo"
+
         departamento = extraer_campo(panel, r"Departamento:")
         municipio = extraer_campo(panel, r"Municipio:")
 
-        id_plaza = f"{departamento}|{area}|{zona}|{municipio}|{cierre}|{secretaria}|{cargo}|{tipo}"
+        id_plaza = f"{departamento}|{area}|{zona_geografica}|{municipio}|{cierre}|{secretaria}|{cargo}|{tipo}"
         id_plaza = id_plaza.lower().replace(" ", "_")
 
         vacante = {
             "id": id_plaza,
             "area": area or "Sin área",
             "secretaria": secretaria or "Sin secretaría",
-            "zona": zona or "Sin zona",
+            "zona": zona_geografica,      # campo original
+            "zona_tipo": zona_tipo,       # NUEVO: urbana/rural
             "departamento": departamento or "Sin departamento",
             "municipio": municipio or "Sin municipio",
             "tipo_priorizacion": tipo or "Sin tipo",
@@ -634,7 +640,7 @@ def construir_resumen_completo(plazas_actuales, plazas_anteriores, total_mapa, c
         for p in sorted(deptos[depto], key=lambda x: x["area"]):
             area_esc = html.escape(abreviar_area(p["area"]))
             municipio_esc = html.escape(p["municipio"])
-            zona_esc = html.escape(p["zona"])
+            zona_esc = html.escape(p["zona_tipo"])
             # Indicar si es nueva (aunque ya esté en la sección de cambios, lo ponemos aquí también)
             es_nueva = p["id"] in [n["id"] for n in cambios["nuevas"]]
             label = " 🆕" if es_nueva else ""
@@ -832,7 +838,7 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
 
             area_esc = html.escape(abreviar_area(p["area"]))
             municipio_esc = html.escape(p["municipio"])
-            zona_esc = html.escape(p["zona"])
+            zona_esc = html.escape(p["zona_tipo"])
 
             if es_nueva:
                 linea = f"  • {area_esc} ({municipio_esc} - {zona_esc}) 🆕 – {p['postulados']} postulados"
@@ -965,7 +971,7 @@ def construir_resumen_filtrado(plazas_filtradas, encabezado=None):
             for p in sorted(deptos[depto], key=lambda x: x["area"]):
                 area_esc = html.escape(abreviar_area(p["area"]))
                 municipio_esc = html.escape(p["municipio"])
-                zona_esc = html.escape(p["zona"])
+                zona_esc = html.escape(p["zona_tipo"])
                 lineas.append(f"  • {area_esc} ({municipio_esc} - {zona_esc}) – {p['postulados']} postulados")
             lineas.append("")
 
