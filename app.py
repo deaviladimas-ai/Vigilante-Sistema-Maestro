@@ -597,30 +597,7 @@ def construir_resumen_completo(plazas_actuales, plazas_anteriores, total_mapa, c
     lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer}")
     lineas.append("")
 
-    # Sección de cambios
-    if cambios["total_nuevas"] > 0 or cambios["total_eliminadas"] > 0 or cambios["total_actualizadas"] > 0:
-        lineas.append("--- <b>CAMBIOS DETECTADOS</b> ---")
-        lineas.append("")
-
-        if cambios["total_nuevas"] > 0:
-            lineas.append(f"🆕 <b>Nuevas plazas ({cambios['total_nuevas']}):</b>")
-            for p in cambios["nuevas"]:
-                lineas.append(f"  • {p['area']} ({p['municipio']}) – {p['postulados']} postulados")
-            lineas.append("")
-
-        if cambios["total_eliminadas"] > 0:
-            lineas.append(f"❌ <b>Plazas eliminadas ({cambios['total_eliminadas']}):</b>")
-            for p in cambios["eliminadas"]:
-                lineas.append(f"  • {p['area']} ({p['municipio']})")
-            lineas.append("")
-
-        if cambios["total_actualizadas"] > 0:
-            lineas.append(f"🔄 <b>Postulados actualizados ({cambios['total_actualizadas']}):</b>")
-            for p in cambios["actualizadas"]:
-                flecha = "↑" if p["postulados_actual"] > p["postulados_anterior"] else "↓"
-                lineas.append(f"  • {p['area']} ({p['departamento']}): {p['postulados_anterior']} → {p['postulados_actual']} {flecha}")
-            lineas.append("")
-
+   
     # Todas las plazas activas (agrupadas por departamento)
     deptos = defaultdict(list)
     for p in plazas_actuales:
