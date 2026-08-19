@@ -254,9 +254,10 @@ def parsear_vacantes(html_fragmento):
         area = extraer_campo(panel, r"Área:")
         secretaria = extraer_campo(panel, r"Secretaría de Educación:")
 
-        # Extraer zonas (hay dos)
+        # Extraer zona geográfica (primera)
         zonas = panel.find_all("label", string=re.compile(r"Zona:"))
         zona_geografica = zonas[0].get_text(strip=True).replace("Zona:", "").strip() if zonas else "Sin zona"
+        # Extraer zona tipo (segunda, si existe)
         zona_tipo = zonas[1].get_text(strip=True).replace("Zona:", "").strip() if len(zonas) > 1 else "Sin tipo"
 
         departamento = extraer_campo(panel, r"Departamento:")
@@ -269,8 +270,8 @@ def parsear_vacantes(html_fragmento):
             "id": id_plaza,
             "area": area or "Sin área",
             "secretaria": secretaria or "Sin secretaría",
-            "zona": zona_geografica,      # campo original
-            "zona_tipo": zona_tipo,       # NUEVO: urbana/rural
+            "zona": zona_geografica,      
+            "zona_tipo": zona_tipo,       
             "departamento": departamento or "Sin departamento",
             "municipio": municipio or "Sin municipio",
             "tipo_priorizacion": tipo or "Sin tipo",
@@ -280,6 +281,79 @@ def parsear_vacantes(html_fragmento):
         }
         vacantes.append(vacante)
     return vacantes
+
+def expandir_todos_detalles(session, viewstate, html_actual):
+    """
+    Dado el HTML de la tabla (con posibles detalles contraídos), hace clic en
+    todos los enlaces "Ver detalle" secuencialmente y devuelve el HTML final
+    con todos los detalles expandidos y el viewstate actualizado.
+    """
+    soup = BeautifulSoup(html_actual, 'html.parser')
+    max_intentos = 50   # seguridad, para evitar bucles infinitos
+    intentos = 0
+
+    while intentos < max_intentos:
+        # Buscar todos los enlaces con texto "Ver detalle" dentro de div.vacante
+        enlaces = soup.select('div.vacante a.ui-commandlink')
+        enlaces_ver = [a for a in enlaces if a.get_text(strip=True) == "Ver detalle"]
+
+        if not enlaces_ver:
+            break   # ya no hay detalles contraídos
+
+        # Tomar el primer enlace "Ver detalle" (después de expandir uno, la tabla se actualiza)
+        enlace = enlaces_ver[0]
+        source_id = enlace.get('id')
+        if not source_id:
+            break
+
+        # Construir datos para la petición AJAX (similar a pedir_pagina_filtrada)
+        data = {
+            "javax.faces.partial.ajax": "true",
+            "javax.faces.source": source_id,
+            "javax.faces.partial.execute": "@all",
+            "javax.faces.partial.render": "form-busqueda:tabla-vacantes",
+            "javax.faces.behavior.event": "click",
+            "javax.faces.partial.event": "click",
+            source_id: source_id,
+            "form-busqueda": "form-busqueda",
+            "javax.faces.ViewState": viewstate,
+            # Incluir otros campos que puedan ser necesarios (filtros, etc.)
+            # Se pueden extraer del HTML actual, pero para simplificar usamos los mismos
+            # que enviamos en la paginación. Como no los tenemos aquí, podemos dejar
+            # solo los esenciales; en la práctica, el servidor a menudo acepta esto.
+            # Para mayor robustez, extraemos todos los inputs ocultos del formulario.
+        }
+
+        # Extraer inputs ocultos del formulario actual (para mantener estado)
+        formulario = soup.find('form', id='form-busqueda')
+        if formulario:
+            for input_hidden in formulario.find_all('input', type='hidden'):
+                name = input_hidden.get('name')
+                value = input_hidden.get('value', '')
+                if name and name not in data:
+                    data[name] = value
+
+        # Enviar la petición
+        response = session.post(URL_PAGINA, headers=HEADERS_AJAX, data=data, timeout=30)
+        resultado = extraer_actualizaciones(response.text)
+
+        # Actualizar viewstate y HTML
+        nuevo_viewstate = resultado.get("viewstate")
+        if nuevo_viewstate:
+            viewstate = nuevo_viewstate
+        nuevo_html = resultado.get("html")
+        if nuevo_html:
+            html_actual = nuevo_html
+        else:
+            # Si no se recibió HTML, puede ser que la respuesta no tenga update de la tabla
+            # En ese caso, mantenemos el HTML anterior y salimos
+            break
+
+        # Reconstruir soup para la siguiente iteración
+        soup = BeautifulSoup(html_actual, 'html.parser')
+        intentos += 1
+
+    return html_actual, viewstate
 
 def desambiguar_ids(vacantes):
     """Agrega sufijos a IDs duplicados (por plazas gemelas)."""
@@ -327,7 +401,8 @@ def cambiar_filtro_departamento(session, viewstate, codigo_departamento):
 
 def pedir_pagina_filtrada(session, viewstate, first, rows, codigo_departamento):
     """
-    Pide una página de resultados YA con el filtro de departamento activo.
+    Pide una página de resultados YA con el filtro de departamento activo,
+    y expande todos los detalles para obtener la información completa.
     """
     data = {
         "javax.faces.partial.ajax": "true",
@@ -358,7 +433,16 @@ def pedir_pagina_filtrada(session, viewstate, first, rows, codigo_departamento):
     r = session.post(URL_PAGINA, headers=HEADERS_AJAX, data=data, timeout=30)
     resultado = extraer_actualizaciones(r.text)
     nuevo_viewstate = resultado["viewstate"] or viewstate
-    return resultado["html"], nuevo_viewstate
+    html_frag = resultado["html"]
+
+    # Expandir todos los detalles (opción 3)
+    try:
+        html_expandido, nuevo_viewstate = expandir_todos_detalles(session, nuevo_viewstate, html_frag)
+        return html_expandido, nuevo_viewstate
+    except Exception as e:
+        print(f"⚠️ Error al expandir detalles en página {first//rows + 1}: {e}")
+        # En caso de error, devolvemos el HTML original y el viewstate actualizado
+        return html_frag, nuevo_viewstate
 
 def obtener_vacantes_por_departamento(nombre_departamento):
     """
