@@ -258,7 +258,7 @@ def parsear_vacantes(html_fragmento):
         zonas = panel.find_all("label", string=re.compile(r"Zona:"))
         zona_geografica = zonas[0].get_text(strip=True).replace("Zona:", "").strip() if zonas else "Sin zona"
         # Extraer zona tipo (segunda, si existe)
-        zona_tipo = zonas[1].get_text(strip=True).replace("Zona:", "").strip() if len(zonas) > 1 else "Sin tipo"
+        zona_tipo = zonas[1].get_text(strip=True).replace("Zona:", "").strip().capitalize() if len(zonas) > 1 else "Sin tipo"
 
         departamento = extraer_campo(panel, r"Departamento:")
         municipio = extraer_campo(panel, r"Municipio:")
