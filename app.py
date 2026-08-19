@@ -555,7 +555,7 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
 
         hay_cambios = (cambios["total_nuevas"] > 0 or
                        cambios["total_eliminadas"] > 0 or
-                      # cambios["total_actualizadas"] > 0 or
+                       cambios["total_actualizadas"] > 0 or
                        len(plazas_vencidas) > 0)
 
         debe_notificar = hay_cambios or notificar_siempre
