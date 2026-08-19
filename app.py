@@ -99,7 +99,7 @@ AREA_ABREVIATURAS = {
     "humanidades y lengua castellana": "Hum. y Len. Castellana",
     "idioma extranjero inglés": "Inglés",
     "matemáticas": "Matemáticas",
-    "tecnología e informática": "Tecno/Infor",
+    "tecnología e informática": "Tecno-Infor",
 
     # Áreas de apoyo y niveles educativos
     "áreas de apoyo para educación especial": "Apoyo Ed. Especial",
@@ -645,7 +645,7 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
 
         hay_cambios = (cambios["total_nuevas"] > 0 or
                        cambios["total_eliminadas"] > 0 or
-                       cambios["total_actualizadas"] > 0 or
+                       # cambios["total_actualizadas"] > 0 or
                        len(plazas_vencidas) > 0)
 
         debe_notificar = hay_cambios or notificar_siempre
