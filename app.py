@@ -75,8 +75,8 @@ AREA_ABREVIATURAS = {
 
     # Ciencias
     "ciencias económicas y políticas": "C. Económicas",
-    "ciencias naturales física": "C. Naturales (Física)",
-    "ciencias naturales química": "C. Naturales (Química)",
+    "ciencias naturales física": "C. Naturales - Física",
+    "ciencias naturales química": "C. Naturales - Química",
     "ciencias naturales y educación ambiental": "C. Naturales",
     "ciencias sociales": "C. Sociales",
 
@@ -87,19 +87,19 @@ AREA_ABREVIATURAS = {
     "educación artística – música": "Música",
 
     # Educación artística (programa PTA)
-    "educación artística - danzas (programa pta)": "Danzas (PTA)",
-    "educación artística - literatura (programa pta)": "Literatura (PTA)",
-    "educación artística - música (programa pta)": "Música (PTA)",
+    "educación artística - danzas (programa pta)": "Danzas - PTA",
+    "educación artística - literatura (programa pta)": "Literatura - PTA",
+    "educación artística - música (programa pta)": "Música - PTA",
 
     # Otras áreas
     "educación ética y en valores": "Ética y Valores",
     "educación física, recreación y deporte": "Ed. Física",
     "educación religiosa": "Religión",
     "filosofía": "Filosofía",
-    "humanidades y lengua castellana": "Lengua Castellana",
+    "humanidades y lengua castellana": "Hum. y Len. Castellana",
     "idioma extranjero inglés": "Inglés",
     "matemáticas": "Matemáticas",
-    "tecnología e informática": "Tecnología",
+    "tecnología e informática": "Tecno/Infor",
 
     # Áreas de apoyo y niveles educativos
     "áreas de apoyo para educación especial": "Apoyo Ed. Especial",
