@@ -634,10 +634,11 @@ def construir_resumen_completo(plazas_actuales, plazas_anteriores, total_mapa, c
         for p in sorted(deptos[depto], key=lambda x: x["area"]):
             area_esc = html.escape(abreviar_area(p["area"]))
             municipio_esc = html.escape(p["municipio"])
+            zona_esc = html.escape(p["zona"])
             # Indicar si es nueva (aunque ya esté en la sección de cambios, lo ponemos aquí también)
             es_nueva = p["id"] in [n["id"] for n in cambios["nuevas"]]
             label = " 🆕" if es_nueva else ""
-            lineas.append(f"  • {area_esc} ({municipio_esc}){label} – {p['postulados']} postulados")
+            lineas.append(f"  • {area_esc} ({municipio_esc} - {zona_esc}){label} – {p['postulados']} postulados")
         lineas.append("")
 
     lineas.append("")
@@ -831,9 +832,10 @@ def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None,
 
             area_esc = html.escape(abreviar_area(p["area"]))
             municipio_esc = html.escape(p["municipio"])
+            zona_esc = html.escape(p["zona"])
 
             if es_nueva:
-                linea = f"  • {area_esc} ({municipio_esc}) 🆕 – {p['postulados']} postulados"
+                linea = f"  • {area_esc} ({municipio_esc} - {zona_esc}) 🆕 – {p['postulados']} postulados"
             else:
                 flecha = ""
                 if cambio:
@@ -963,7 +965,8 @@ def construir_resumen_filtrado(plazas_filtradas, encabezado=None):
             for p in sorted(deptos[depto], key=lambda x: x["area"]):
                 area_esc = html.escape(abreviar_area(p["area"]))
                 municipio_esc = html.escape(p["municipio"])
-                lineas.append(f"  • {area_esc} ({municipio_esc}) – {p['postulados']} postulados")
+                zona_esc = html.escape(p["zona"])
+                lineas.append(f"  • {area_esc} ({municipio_esc} - {zona_esc}) – {p['postulados']} postulados")
             lineas.append("")
 
     lineas.append("")
