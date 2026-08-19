@@ -517,78 +517,50 @@ def limpiar_plazas_vencidas(plazas):
 # ========== FLUJO PRINCIPAL ==========
 
 def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
-    """
-    Flujo principal automatizado MEJORADO:
-    1. Limpiar plazas vencidas del JSON.
-    2. Obtener total del mapa y total del JSON.
-    3. SIEMPRE que el total del mapa sea DIFERENTE al guardado,
-       O si ha pasado más de 1 hora desde la última actualización completa,
-       entonces hacer scraping COMPLETO de TODOS los departamentos.
-    4. Detectar cambios: nuevas, eliminadas, actualizadas.
-    5. Notificar por Telegram si hay cambios o si se fuerza.
-    """
     try:
-        # Cargar datos actuales y anteriores
+        # 1. Cargar datos anteriores
         plazas_bd = cargar_datos_anteriores()
         total_json_actual = len(plazas_bd)
         plazas_antes = plazas_bd.copy()
 
-        # Limpiar vencidas
+        # 2. Limpiar vencidas
         plazas_vigentes, plazas_vencidas = limpiar_plazas_vencidas(plazas_bd)
         if plazas_vencidas:
             guardar_datos_actuales(plazas_vigentes)
             plazas_bd = plazas_vigentes
             total_json_actual = len(plazas_bd)
 
-        # Obtener total del mapa actual y el anterior guardado
+        # 3. Obtener total del mapa actual (para el resumen)
         total_mapa = obtener_total_plazas_mapa()
         total_mapa_anterior = cargar_total_mapa_anterior()
 
-        # Determinar si debemos hacer scraping completo
-        debe_scrapear_completo = False
-        if total_mapa != total_mapa_anterior:
-            debe_scrapear_completo = True
-        else:
-            # Si el total no cambió, pero ha pasado más de 1 hora desde la última
-            # actualización completa, también hacemos scraping para capturar
-            # cambios que no alteraron el total (entra/sale misma cantidad)
-            ultima_actualizacion_completa = cargar_ultima_actualizacion_completa()
-            if ultima_actualizacion_completa is None or (datetime.now(ZONA_COLOMBIA) - ultima_actualizacion_completa) > timedelta(hours=1):
-                debe_scrapear_completo = True
+        # 4. SCRAPING COMPLETO SIEMPRE
+        print("🔄 Ejecutando scraping completo de todos los departamentos...")
+        deptos_mapa = obtener_departamentos_del_mapa()
+        nuevas_plazas_totales = []
+        for depto in deptos_mapa:
+            try:
+                plazas_depto = obtener_vacantes_por_departamento(depto)
+                nuevas_plazas_totales.extend(plazas_depto)
+            except Exception as e:
+                print(f"⚠️ Error scraping {depto}: {e}")
+        # Fusionar con JSON actual
+        plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, nuevas_plazas_totales)
+        guardar_datos_actuales(plazas_bd)
+        guardar_ultima_actualizacion_completa(datetime.now(ZONA_COLOMBIA))
+        total_json_actual = len(plazas_bd)
 
-        if debe_scrapear_completo:
-            print("🔄 Ejecutando scraping completo de todos los departamentos...")
-            # Obtener todos los departamentos del mapa
-            deptos_mapa = obtener_departamentos_del_mapa()
-            nuevas_plazas_totales = []
-            for depto in deptos_mapa:
-                try:
-                    plazas_depto = obtener_vacantes_por_departamento(depto)
-                    nuevas_plazas_totales.extend(plazas_depto)
-                except Exception as e:
-                    print(f"⚠️ Error scraping {depto}: {e}")
-            # Fusionar con JSON actual
-            plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, nuevas_plazas_totales)
-            guardar_datos_actuales(plazas_bd)
-            # Guardar timestamp de actualización completa
-            guardar_ultima_actualizacion_completa(datetime.now(ZONA_COLOMBIA))
-            total_json_actual = len(plazas_bd)
-
-        # Ahora detectar cambios comparando con la versión anterior (antes de cualquier scraping)
+        # 5. Detectar cambios (nuevas, eliminadas, actualizadas)
         cambios = detectar_cambios_completos(plazas_bd, plazas_antes)
 
-        hay_cambios = (
-            (total_mapa != total_mapa_anterior) or
-            cambios["total_nuevas"] > 0 or
-            cambios["total_eliminadas"] > 0 or
-            cambios["total_actualizadas"] > 0 or
-            len(plazas_vencidas) > 0
-        )
+        hay_cambios = (cambios["total_nuevas"] > 0 or
+                       cambios["total_eliminadas"] > 0 or
+                       cambios["total_actualizadas"] > 0 or
+                       len(plazas_vencidas) > 0)
 
         debe_notificar = hay_cambios or notificar_siempre
 
         if debe_notificar:
-            # Construir resumen incluyendo eliminadas
             resumen = construir_resumen_completo(
                 plazas_bd,
                 plazas_antes,
