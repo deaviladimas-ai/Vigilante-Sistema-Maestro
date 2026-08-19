@@ -1200,7 +1200,13 @@ def set_webhook():
 
 @app.route("/check")
 def check():
-    resultado = ejecutar_vigilante(notificar_siempre=False)
+    adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
+    if not adquirido:
+        return {"resultado": "Ya hay una ejecución en curso, se omitió este chequeo."}
+    try:
+        resultado = ejecutar_vigilante(notificar_siempre=False)
+    finally:
+        lock_ejecucion_vigilante.release()
     return {"resultado": resultado}
 
 @app.route("/check-force")
