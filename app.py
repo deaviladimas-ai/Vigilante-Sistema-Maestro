@@ -466,60 +466,82 @@ def limpiar_plazas_vencidas(plazas):
 
 def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
     """
-    Flujo principal automatizado:
+    Flujo principal automatizado MEJORADO:
     1. Limpiar plazas vencidas del JSON.
     2. Obtener total del mapa y total del JSON.
-    3. Si faltan plazas, agregar todas las pendientes por departamento.
-    4. Detectar cambios (plazas nuevas, postulados que cambiaron).
-    5. Notificar por Telegram (si hay cambios o si se fuerza).
-
-    chat_id: si se especifica (por ejemplo, cuando alguien escribe "Actualizar"
-    en el chat), el mensaje de resultado se envía a ESE chat en vez del
-    TELEGRAM_CHAT_ID configurado por defecto.
+    3. SIEMPRE que el total del mapa sea DIFERENTE al guardado,
+       O si ha pasado más de 1 hora desde la última actualización completa,
+       entonces hacer scraping COMPLETO de TODOS los departamentos.
+    4. Detectar cambios: nuevas, eliminadas, actualizadas.
+    5. Notificar por Telegram si hay cambios o si se fuerza.
     """
     try:
+        # Cargar datos actuales y anteriores
         plazas_bd = cargar_datos_anteriores()
         total_json_actual = len(plazas_bd)
         plazas_antes = plazas_bd.copy()
 
+        # Limpiar vencidas
         plazas_vigentes, plazas_vencidas = limpiar_plazas_vencidas(plazas_bd)
         if plazas_vencidas:
             guardar_datos_actuales(plazas_vigentes)
             plazas_bd = plazas_vigentes
             total_json_actual = len(plazas_bd)
 
+        # Obtener total del mapa actual y el anterior guardado
         total_mapa = obtener_total_plazas_mapa()
         total_mapa_anterior = cargar_total_mapa_anterior()
 
-        if total_mapa > total_json_actual:
-            departamentos_pendientes = obtener_departamentos_pendientes()
-            for depto in departamentos_pendientes:
+        # Determinar si debemos hacer scraping completo
+        debe_scrapear_completo = False
+        if total_mapa != total_mapa_anterior:
+            debe_scrapear_completo = True
+        else:
+            # Si el total no cambió, pero ha pasado más de 1 hora desde la última
+            # actualización completa, también hacemos scraping para capturar
+            # cambios que no alteraron el total (entra/sale misma cantidad)
+            ultima_actualizacion_completa = cargar_ultima_actualizacion_completa()
+            if ultima_actualizacion_completa is None or (datetime.now(ZONA_COLOMBIA) - ultima_actualizacion_completa) > timedelta(hours=1):
+                debe_scrapear_completo = True
+
+        if debe_scrapear_completo:
+            print("🔄 Ejecutando scraping completo de todos los departamentos...")
+            # Obtener todos los departamentos del mapa
+            deptos_mapa = obtener_departamentos_del_mapa()
+            nuevas_plazas_totales = []
+            for depto in deptos_mapa:
                 try:
                     plazas_depto = obtener_vacantes_por_departamento(depto)
-                    plazas_bd, _ = fusionar_plazas(plazas_bd, plazas_depto)
-                    guardar_datos_actuales(plazas_bd)
+                    nuevas_plazas_totales.extend(plazas_depto)
                 except Exception as e:
-                    print(f"Error agregando {depto}: {e}")
-            plazas_bd = cargar_datos_anteriores()
+                    print(f"⚠️ Error scraping {depto}: {e}")
+            # Fusionar con JSON actual
+            plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, nuevas_plazas_totales)
+            guardar_datos_actuales(plazas_bd)
+            # Guardar timestamp de actualización completa
+            guardar_ultima_actualizacion_completa(datetime.now(ZONA_COLOMBIA))
             total_json_actual = len(plazas_bd)
 
-        cambios = detectar_cambios(plazas_bd, plazas_antes)
+        # Ahora detectar cambios comparando con la versión anterior (antes de cualquier scraping)
+        cambios = detectar_cambios_completos(plazas_bd, plazas_antes)
 
         hay_cambios = (
             (total_mapa != total_mapa_anterior) or
             cambios["total_nuevas"] > 0 or
+            cambios["total_eliminadas"] > 0 or
             cambios["total_actualizadas"] > 0 or
             len(plazas_vencidas) > 0
         )
+
         debe_notificar = hay_cambios or notificar_siempre
 
         if debe_notificar:
-            ids_nuevas = {p["id"] for p in cambios["nuevas"]}
-            resumen = construir_resumen(
+            # Construir resumen incluyendo eliminadas
+            resumen = construir_resumen_completo(
                 plazas_bd,
-                plazas_bd,
+                plazas_antes,
                 total_mapa,
-                ids_nuevas,
+                cambios,
                 total_mapa_anterior
             )
             enviar_telegram(resumen, chat_id=chat_id)
@@ -535,6 +557,136 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
     except Exception as e:
         enviar_telegram(f"⚠️ Error en vigilante: {str(e)[:200]}", chat_id=chat_id)
         return f"Error: {str(e)[:100]}"
+
+ARCHIVO_ULTIMA_ACTUALIZACION = "ultima_actualizacion_completa.json"
+
+def guardar_ultima_actualizacion_completa(fecha):
+    with open(ARCHIVO_ULTIMA_ACTUALIZACION, "w", encoding="utf-8") as f:
+        json.dump({"ultima": fecha.isoformat()}, f)
+
+def cargar_ultima_actualizacion_completa():
+    if os.path.exists(ARCHIVO_ULTIMA_ACTUALIZACION):
+        try:
+            with open(ARCHIVO_ULTIMA_ACTUALIZACION, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return datetime.fromisoformat(data["ultima"]).replace(tzinfo=ZONA_COLOMBIA)
+        except:
+            return None
+    return None
+
+def construir_resumen_completo(plazas_actuales, plazas_anteriores, total_mapa, cambios, total_mapa_anterior):
+    """
+    Construye el mensaje para Telegram incluyendo eliminadas.
+    """
+    total_hoy, total_ayer = contar_plazas_por_activacion(plazas_actuales)
+
+    lineas = []
+    lineas.append("🚨 <b>¡ACTUALIZACIÓN DE PLAZAS SISTEMA MAESTRO!</b> 🚨")
+    lineas.append("")
+
+    # Totales
+    diferencia = total_mapa - total_mapa_anterior if total_mapa_anterior is not None else 0
+    if diferencia > 0:
+        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>(+{diferencia})</b> ⬆️")
+    elif diferencia < 0:
+        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>({diferencia})</b> ⬇️")
+    else:
+        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} ↔️")
+
+    lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy}")
+    lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer}")
+    lineas.append("")
+
+    # Sección de cambios
+    if cambios["total_nuevas"] > 0 or cambios["total_eliminadas"] > 0 or cambios["total_actualizadas"] > 0:
+        lineas.append("--- <b>CAMBIOS DETECTADOS</b> ---")
+        lineas.append("")
+
+        if cambios["total_nuevas"] > 0:
+            lineas.append(f"🆕 <b>Nuevas plazas ({cambios['total_nuevas']}):</b>")
+            for p in cambios["nuevas"]:
+                lineas.append(f"  • {p['area']} ({p['municipio']}) – {p['postulados']} postulados")
+            lineas.append("")
+
+        if cambios["total_eliminadas"] > 0:
+            lineas.append(f"❌ <b>Plazas eliminadas ({cambios['total_eliminadas']}):</b>")
+            for p in cambios["eliminadas"]:
+                lineas.append(f"  • {p['area']} ({p['municipio']})")
+            lineas.append("")
+
+        if cambios["total_actualizadas"] > 0:
+            lineas.append(f"🔄 <b>Postulados actualizados ({cambios['total_actualizadas']}):</b>")
+            for p in cambios["actualizadas"]:
+                flecha = "↑" if p["postulados_actual"] > p["postulados_anterior"] else "↓"
+                lineas.append(f"  • {p['area']} ({p['departamento']}): {p['postulados_anterior']} → {p['postulados_actual']} {flecha}")
+            lineas.append("")
+
+    # Todas las plazas activas (agrupadas por departamento)
+    deptos = defaultdict(list)
+    for p in plazas_actuales:
+        deptos[p["departamento"]].append(p)
+
+    lineas.append("--- <b>TODAS LAS PLAZAS ACTIVAS</b> ---")
+    lineas.append("")
+    for depto in sorted(deptos.keys()):
+        lineas.append(f"📌 <b>{html.escape(depto)}</b>")
+        for p in sorted(deptos[depto], key=lambda x: x["area"]):
+            area_esc = html.escape(p["area"])
+            municipio_esc = html.escape(p["municipio"])
+            # Indicar si es nueva (aunque ya esté en la sección de cambios, lo ponemos aquí también)
+            es_nueva = p["id"] in [n["id"] for n in cambios["nuevas"]]
+            label = " 🆕" if es_nueva else ""
+            lineas.append(f"  • {area_esc} ({municipio_esc}){label} – {p['postulados']} postulados")
+        lineas.append("")
+
+    lineas.append("")
+    lineas.append(f'🔗 <a href="{URL_PAGINA}">Ir a la página Sistema Maestro</a>')
+
+    return "\n".join(lineas)
+
+
+def detectar_cambios_completos(plazas_actuales, plazas_anteriores):
+    """
+    Compara dos listas de plazas y detecta:
+    - nuevas: plazas que no estaban en la versión anterior.
+    - eliminadas: plazas que estaban en la anterior pero no en la actual.
+    - actualizadas: plazas cuyo postulados cambiaron.
+    """
+    anteriores_por_id = {p["id"]: p for p in plazas_anteriores}
+    actuales_por_id = {p["id"]: p for p in plazas_actuales}
+
+    nuevas = []
+    eliminadas = []
+    actualizadas = []
+
+    # Detectar nuevas y actualizadas
+    for id_plaza, p_actual in actuales_por_id.items():
+        if id_plaza not in anteriores_por_id:
+            nuevas.append(p_actual)
+        else:
+            p_anterior = anteriores_por_id[id_plaza]
+            if p_actual["postulados"] != p_anterior["postulados"]:
+                actualizadas.append({
+                    "id": id_plaza,
+                    "departamento": p_actual["departamento"],
+                    "area": p_actual["area"],
+                    "postulados_anterior": p_anterior["postulados"],
+                    "postulados_actual": p_actual["postulados"]
+                })
+
+    # Detectar eliminadas
+    for id_plaza, p_anterior in anteriores_por_id.items():
+        if id_plaza not in actuales_por_id:
+            eliminadas.append(p_anterior)
+
+    return {
+        "nuevas": nuevas,
+        "eliminadas": eliminadas,
+        "actualizadas": actualizadas,
+        "total_nuevas": len(nuevas),
+        "total_eliminadas": len(eliminadas),
+        "total_actualizadas": len(actualizadas)
+    }
 
 def obtener_departamentos_pendientes():
     """
