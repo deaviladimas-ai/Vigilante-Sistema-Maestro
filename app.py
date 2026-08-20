@@ -1290,14 +1290,24 @@ def set_webhook():
 
 @app.route("/check")
 def check():
+    # 1. Intentar adquirir el lock SIN bloquear (igual que en tu código original)
     adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
     if not adquirido:
-        return {"resultado": "Ya hay una ejecución en curso, se omitió este chequeo."}
-    try:
-        resultado = ejecutar_vigilante(notificar_siempre=False)
-    finally:
-        lock_ejecucion_vigilante.release()
-    return {"resultado": resultado}
+        return {"resultado": "Ya hay una ejecución en curso, se omitió este chequeo."}, 409  # Conflict
+
+    # 2. Lanzar un hilo que ejecute la tarea y, al terminar, libere el lock
+    def tarea_con_lock():
+        try:
+            ejecutar_vigilante(notificar_siempre=False)
+        except Exception as e:
+            print(f"Error en hilo de /check: {e}")
+        finally:
+            lock_ejecucion_vigilante.release()
+
+    threading.Thread(target=tarea_con_lock, daemon=True).start()
+
+    # 3. Responder inmediatamente para que cron-job.org no haga timeout
+    return {"resultado": "Tarea iniciada en segundo plano"}, 202
 
 @app.route("/check-force")
 def check_force():
