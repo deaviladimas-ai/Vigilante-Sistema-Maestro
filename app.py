@@ -669,7 +669,7 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
             return "Sin cambios notificables."
 
     except Exception as e:
-        enviar_telegram(f"⚠️ Error en vigilante: {str(e)[:200]}", chat_id=chat_id)
+        #enviar_telegram(f"⚠️ Error en vigilante: {str(e)[:200]}", chat_id=chat_id)
         return f"Error: {str(e)[:100]}"
 
 ARCHIVO_ULTIMA_ACTUALIZACION = "ultima_actualizacion_completa.json"
