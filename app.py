@@ -550,6 +550,103 @@ def fusionar_plazas_reconciliando(plazas_bd, plazas_scrapeadas, departamento):
     resultado = conservadas + list(bd_depto_por_id.values())
     return resultado, ids_nuevas
 
+def fusionar_plazas_reconciliando_seguro(plazas_bd, plazas_scrapeadas, departamento, cantidad_esperada=None):
+    """
+    Reconcilia (agrega/actualiza/borra) las plazas de un departamento SOLO
+    si el scrape parece completo. Si `cantidad_esperada` se provee y el
+    scrape trajo MENOS plazas de las esperadas según el mapa, se asume que
+    el scrape fue parcial (timeout, error a mitad de página, etc.) y se
+    hace solo un merge ADITIVO (nunca se borra nada), para evitar falsos
+    "eliminadas" que luego reaparecen como "nuevas" y generan
+    notificaciones de Telegram sin que haya cambiado nada de verdad.
+    """
+    if cantidad_esperada is not None and len(plazas_scrapeadas) < cantidad_esperada:
+        print(
+            f"⚠️ Scrape incompleto de {departamento}: se obtuvieron "
+            f"{len(plazas_scrapeadas)} de {cantidad_esperada} esperadas según el mapa. "
+            f"No se reconcilia (no se borra nada), solo se agrega/actualiza."
+        )
+        bd_por_id = {p["id"]: dict(p) for p in plazas_bd}
+        ids_nuevas = set()
+        for p in plazas_scrapeadas:
+            if p["id"] in bd_por_id:
+                bd_por_id[p["id"]].update(p)
+            else:
+                bd_por_id[p["id"]] = dict(p)
+                ids_nuevas.add(p["id"])
+        return list(bd_por_id.values()), ids_nuevas
+
+    # Scrape completo (o sin dato de referencia para comparar) -> reconciliar normalmente
+    return fusionar_plazas_reconciliando(plazas_bd, plazas_scrapeadas, departamento)
+
+def actualizar_postulados_departamento(nombre_departamento, conteo_mapa=None):
+    plazas_scrapeadas = obtener_vacantes_por_departamento(nombre_departamento)
+
+    if conteo_mapa is None:
+        try:
+            conteo_mapa = obtener_conteo_marcadores_por_departamento()
+        except Exception as e:
+            print(f"⚠️ No se pudo obtener conteo del mapa, se reconcilia sin verificación: {e}")
+            conteo_mapa = {}
+
+    cantidad_esperada = conteo_mapa.get(nombre_departamento)
+
+    with lock_json:
+        plazas_bd = cargar_datos_anteriores()
+        total_antes = len([p for p in plazas_bd if p.get("departamento") == nombre_departamento])
+
+        plazas_bd, ids_nuevas = fusionar_plazas_reconciliando_seguro(
+            plazas_bd, plazas_scrapeadas, nombre_departamento, cantidad_esperada
+        )
+        guardar_datos_actuales(plazas_bd)
+
+        total_despues = len([p for p in plazas_bd if p.get("departamento") == nombre_departamento])
+        eliminadas = total_antes - total_despues + len(ids_nuevas)
+        if eliminadas > 0:
+            print(f"🗑️ Reconciliación {nombre_departamento}: {eliminadas} plaza(s) fantasma eliminada(s)")
+
+    return len(plazas_scrapeadas), len(ids_nuevas)
+
+def hilo_actualizador_postulados():
+    print(f"🧵 Hilo actualizador de postulados iniciado (cada {INTERVALO_ACTUALIZACION_POSTULADOS}s).")
+    while True:
+        adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
+        if not adquirido:
+            print("⏳ Hilo actualizador: el vigilante ya está scrapeando, se omite este ciclo.")
+            time.sleep(INTERVALO_ACTUALIZACION_POSTULADOS)
+            continue
+
+        try:
+            # 🆕 Limpieza automática de plazas vencidas en cada ciclo
+            with lock_json:
+                plazas_bd = cargar_datos_anteriores()
+                vigentes, vencidas = limpiar_plazas_vencidas(plazas_bd)
+                if vencidas:
+                    guardar_datos_actuales(vigentes)
+                    print(f"🗑️ {len(vencidas)} plaza(s) vencida(s) eliminada(s) automáticamente.")
+
+            departamentos = obtener_departamentos_en_json()
+            if departamentos:
+                print(f"🔄 Refrescando postulados de {len(departamentos)} departamento(s): {', '.join(departamentos)}")
+
+            try:
+                conteo_mapa = obtener_conteo_marcadores_por_departamento()
+            except Exception as e:
+                print(f"⚠️ No se pudo obtener conteo del mapa para este ciclo: {e}")
+                conteo_mapa = {}
+
+            for depto in departamentos:
+                try:
+                    encontradas, nuevas = actualizar_postulados_departamento(depto, conteo_mapa=conteo_mapa)
+                    print(f"   ✔ {depto}: {encontradas} plazas revisadas, {nuevas} nueva(s)")
+                except Exception as e:
+                    print(f"   ✘ Error actualizando postulados de '{depto}': {e}")
+        except Exception as e:
+            print(f"⚠️ Error en hilo actualizador de postulados: {e}")
+        finally:
+            lock_ejecucion_vigilante.release()
+
+        time.sleep(INTERVALO_ACTUALIZACION_POSTULADOS)
 
 def actualizar_postulados_departamento(nombre_departamento):
     plazas_scrapeadas = obtener_vacantes_por_departamento(nombre_departamento)
@@ -646,6 +743,22 @@ def limpiar_plazas_vencidas(plazas):
             vigentes.append(p)
     return vigentes, vencidas
 
+def obtener_conteo_marcadores_por_departamento():
+    """
+    Cuenta cuántos marcadores (plazas) tiene cada departamento según el
+    mapa en vivo. Sirve para verificar si un scrape de un departamento
+    trajo TODAS sus plazas antes de confiar en él para borrar "fantasmas".
+    """
+    r = requests.get(URL_PAGINA, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    r.raise_for_status()
+    patron = r"alt:\s*'DEP-\d+',\s*title:\s*'([^']+)'"
+    titulos = re.findall(patron, r.text)
+    contador = Counter()
+    for t in titulos:
+        nombre = t.split(" - ")[0].strip()
+        contador[nombre] += 1
+    return contador
+
 # ========== FLUJO PRINCIPAL ==========
 
 def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
@@ -653,7 +766,7 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
         # 1. Cargar datos anteriores
         plazas_bd = cargar_datos_anteriores()
         total_json_actual = len(plazas_bd)
-        plazas_antes = plazas_bd.copy()
+        plazas_antes = [dict(p) for p in plazas_bd]  # copia profunda real, evita aliasing
 
         # 2. Limpiar vencidas
         plazas_vigentes, plazas_vencidas = limpiar_plazas_vencidas(plazas_bd)
@@ -662,11 +775,17 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
             plazas_bd = plazas_vigentes
             total_json_actual = len(plazas_bd)
 
-        # 3. Obtener total del mapa actual (para el resumen)
+        # 3. Obtener total del mapa actual (para el resumen) y conteo por depto (para reconciliación segura)
         total_mapa = obtener_total_plazas_mapa()
         total_mapa_anterior = cargar_total_mapa_anterior()
 
-        # 4. SCRAPING COMPLETO SIEMPRE (con reconciliación por departamento)
+        try:
+            conteo_mapa = obtener_conteo_marcadores_por_departamento()
+        except Exception as e:
+            print(f"⚠️ No se pudo obtener conteo del mapa para este ciclo: {e}")
+            conteo_mapa = {}
+
+        # 4. SCRAPING COMPLETO SIEMPRE (con reconciliación segura por departamento)
         print("🔄 Ejecutando scraping completo de todos los departamentos...")
         deptos_mapa = obtener_departamentos_del_mapa()
         ids_nuevas_totales = set()
@@ -674,10 +793,11 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
         for depto in deptos_mapa:
             try:
                 plazas_depto = obtener_vacantes_por_departamento(depto)
+                cantidad_esperada = conteo_mapa.get(depto)
                 total_antes_depto = len([p for p in plazas_bd if p.get("departamento") == depto])
 
-                plazas_bd, ids_nuevas_depto = fusionar_plazas_reconciliando(
-                    plazas_bd, plazas_depto, depto
+                plazas_bd, ids_nuevas_depto = fusionar_plazas_reconciliando_seguro(
+                    plazas_bd, plazas_depto, depto, cantidad_esperada
                 )
                 ids_nuevas_totales |= ids_nuevas_depto
 
@@ -1891,9 +2011,16 @@ def agregar_departamento():
         if not plazas_departamento:
             return {"error": f"No se encontraron plazas para '{departamento_nombre}'."}, 404
 
+        try:
+            conteo_mapa = obtener_conteo_marcadores_por_departamento()
+        except Exception as e:
+            print(f"⚠️ No se pudo obtener conteo del mapa: {e}")
+            conteo_mapa = {}
+        cantidad_esperada = conteo_mapa.get(departamento_nombre)
+
         plazas_bd = cargar_datos_anteriores()
-        plazas_fusionadas, ids_nuevas = fusionar_plazas_reconciliando(
-            plazas_bd, plazas_departamento, departamento_nombre
+        plazas_fusionadas, ids_nuevas = fusionar_plazas_reconciliando_seguro(
+            plazas_bd, plazas_departamento, departamento_nombre, cantidad_esperada
         )
         guardar_datos_actuales(plazas_fusionadas)
 
