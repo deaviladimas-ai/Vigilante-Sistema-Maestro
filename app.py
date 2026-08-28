@@ -128,6 +128,19 @@ INTERVALO_ACTUALIZACION_POSTULADOS = int(os.environ.get("INTERVALO_ACTUALIZACION
 # ========== HILO VIGILANTE AUTOMÁTICO (reemplaza al Cron Job externo) ==========
 INTERVALO_VIGILANTE_SEGUNDOS = int(os.environ.get("INTERVALO_VIGILANTE_SEGUNDOS", 60))
 
+# Cada cuánto se fuerza un scrape completo (con posible eliminación de
+# plazas) aunque el chequeo liviano no haya detectado un aumento del total.
+# Esto es lo que detecta plazas cerradas/llenadas cuando el total del mapa
+# no sube (p. ej. se cierra una y se abre otra en el mismo ciclo).
+INTERVALO_RECONCILIACION_SEGUNDOS = int(os.environ.get("INTERVALO_RECONCILIACION_SEGUNDOS", 900))
+
+# Salvaguarda contra scrapes parciales/rotos: si al reconciliar un
+# departamento llegan muchas menos plazas de las que ya teníamos guardadas,
+# asumimos que el scrape falló a medias (ViewState roto, timeout, etc.) y
+# NO borramos nada de ese departamento en esa corrida.
+UMBRAL_CAIDA_SOSPECHOSA = float(os.environ.get("UMBRAL_CAIDA_SOSPECHOSA", 0.5))
+MIN_PLAZAS_PARA_SOSPECHA = int(os.environ.get("MIN_PLAZAS_PARA_SOSPECHA", 3))
+
 estado_vigilante_automatico = {
     "ultima_ejecucion": None,
     "ultimo_resultado": None,
@@ -513,6 +526,12 @@ def fusionar_plazas_reconciliando(plazas_bd, plazas_scrapeadas, departamento):
     COMPLETO y exitoso de `departamento` (todas sus páginas, sin cortes
     por excepción). Si el scrape fue parcial o falló a mitad de camino,
     usar esta función borraría plazas válidas.
+
+    En la práctica, se recomienda llamar a esta función a través de
+    `fusionar_departamento_con_salvaguarda`, que verifica antes si el
+    número de plazas scrapeadas cayó sospechosamente respecto a lo ya
+    guardado (indicio de scrape parcial) y evita la reconciliación en
+    ese caso.
     """
     ids_scrapeadas = {p["id"] for p in plazas_scrapeadas}
 
@@ -537,6 +556,34 @@ def fusionar_plazas_reconciliando(plazas_bd, plazas_scrapeadas, departamento):
     resultado = conservadas + list(bd_depto_por_id.values())
     return resultado, ids_nuevas
 
+def fusionar_departamento_con_salvaguarda(plazas_bd, plazas_scrapeadas, departamento):
+    """
+    Fusiona las plazas scrapeadas de `departamento` en `plazas_bd`.
+
+    Antes de reconciliar (que puede ELIMINAR plazas que ya no aparecieron
+    en el scrape), compara cuántas plazas de ese departamento había ya
+    guardadas contra cuántas trajo este scrape. Si la caída es demasiado
+    grande, se asume que el scrape fue parcial/roto (ViewState vencido,
+    timeout, sesión cortada, etc.) y se hace un merge PURAMENTE ADITIVO
+    (sin borrar nada), para no generar eliminaciones fantasma.
+
+    Devuelve: (nueva_bd, ids_nuevas, cantidad_eliminadas, fue_caida_sospechosa)
+    """
+    conteo_actual = sum(1 for p in plazas_bd if p.get("departamento") == departamento)
+    caida_sospechosa = (
+        conteo_actual >= MIN_PLAZAS_PARA_SOSPECHA
+        and len(plazas_scrapeadas) < conteo_actual * UMBRAL_CAIDA_SOSPECHOSA
+    )
+
+    if caida_sospechosa:
+        nueva_bd, ids_nuevas = fusionar_plazas(plazas_bd, plazas_scrapeadas)
+        return nueva_bd, ids_nuevas, 0, True
+
+    total_antes = len(plazas_bd)
+    nueva_bd, ids_nuevas = fusionar_plazas_reconciliando(plazas_bd, plazas_scrapeadas, departamento)
+    eliminadas = total_antes + len(plazas_scrapeadas) - len(nueva_bd) - len(ids_nuevas)
+    return nueva_bd, ids_nuevas, max(eliminadas, 0), False
+
 # ========== HILO: REFRESCO DE POSTULADOS POR DEPARTAMENTO ==========
 
 def obtener_departamentos_en_json():
@@ -552,12 +599,12 @@ def actualizar_postulados_departamento(nombre_departamento):
     plazas_scrapeadas = obtener_vacantes_por_departamento(nombre_departamento)
     with lock_json:
         plazas_bd = cargar_datos_anteriores()
-        total_antes = len(plazas_bd)
-        plazas_bd, ids_nuevas = fusionar_plazas_reconciliando(
+        plazas_bd, ids_nuevas, eliminadas, fue_sospechosa = fusionar_departamento_con_salvaguarda(
             plazas_bd, plazas_scrapeadas, nombre_departamento
         )
-        eliminadas = total_antes + len(plazas_scrapeadas) - len(plazas_bd) - len(ids_nuevas)
-        if eliminadas > 0:
+        if fue_sospechosa:
+            print(f"⚠️ Caída sospechosa en '{nombre_departamento}' (hilo de postulados): se omitió la reconciliación (no se eliminó nada).")
+        elif eliminadas > 0:
             print(f"🗑️ Reconciliación '{nombre_departamento}': {eliminadas} plaza(s) fantasma eliminada(s)")
         guardar_datos_actuales(plazas_bd)
     return len(plazas_scrapeadas), len(ids_nuevas)
@@ -587,13 +634,49 @@ def hilo_actualizador_postulados():
             print(f"⚠️ Error en hilo actualizador de postulados: {e}")
         time.sleep(INTERVALO_ACTUALIZACION_POSTULADOS)
 
+def chequeo_liviano_total_mapa():
+    """
+    Chequeo barato: UNA sola petición HTTP sin sesión ni expansión de
+    detalles, que cuenta cuántos marcadores de plaza hay en el mapa.
+    Se usa para decidir si vale la pena disparar el scrape completo
+    (pesado) antes de que toque la reconciliación periódica.
+
+    Devuelve (total_actual, total_anterior) o (None, total_anterior) si
+    falla la petición.
+    """
+    total_anterior = cargar_total_mapa_anterior()
+    try:
+        total_actual = obtener_total_plazas_mapa()
+    except Exception as e:
+        print(f"⚠️ Error en chequeo liviano del mapa: {e}")
+        return None, total_anterior
+    return total_actual, total_anterior
+
 def hilo_vigilante_automatico():
     """
-    Reemplaza al Cron Job externo: corre ejecutar_vigilante() cada
-    INTERVALO_VIGILANTE_SEGUNDOS (por defecto 60s) directamente dentro del
-    proceso de la app, sin depender de que algo de afuera llame a /check.
+    Reemplaza al Cron Job externo. En cada ciclo (cada
+    INTERVALO_VIGILANTE_SEGUNDOS) hace primero un chequeo LIVIANO (una sola
+    petición HTTP) comparando el total de plazas del mapa contra el último
+    total conocido:
+
+      - Si el total SUBIÓ  -> dispara de inmediato el scrape completo
+        (ejecutar_vigilante), para detectar y notificar la(s) plaza(s)
+        nueva(s) casi al instante.
+      - Si no subió pero ya pasó INTERVALO_RECONCILIACION_SEGUNDOS desde
+        la última reconciliación completa -> también dispara el scrape
+        completo, para detectar cierres/plazas llenas.
+      - En cualquier otro caso -> no hace scrape pesado en este ciclo.
+
+    Esto evita estar golpeando el sitio con un scrape completo (con
+    expansión de detalle por cada vacante) cada 60 segundos, que es lo que
+    generaba ViewStates rotos, scrapes parciales, y por lo tanto,
+    eliminaciones "fantasma" falsas.
     """
-    print(f"🧵 Hilo vigilante automático iniciado (cada {INTERVALO_VIGILANTE_SEGUNDOS}s).")
+    print(
+        f"🧵 Hilo vigilante automático iniciado (chequeo liviano cada "
+        f"{INTERVALO_VIGILANTE_SEGUNDOS}s, reconciliación completa cada "
+        f"{INTERVALO_RECONCILIACION_SEGUNDOS}s o antes si sube el total)."
+    )
     time.sleep(5)
     while True:
         adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
@@ -601,12 +684,37 @@ def hilo_vigilante_automatico():
             time.sleep(INTERVALO_VIGILANTE_SEGUNDOS)
             continue
         try:
-            resultado = ejecutar_vigilante(notificar_siempre=False)
-            with lock_estado_vigilante:
-                estado_vigilante_automatico["ultima_ejecucion"] = datetime.now(ZONA_COLOMBIA).isoformat()
-                estado_vigilante_automatico["ultimo_resultado"] = resultado
-                estado_vigilante_automatico["ejecuciones"] += 1
-            print(f"🔍 Chequeo automático: {resultado}")
+            total_actual, total_anterior = chequeo_liviano_total_mapa()
+            hay_posibles_nuevas = (
+                total_actual is not None
+                and total_anterior is not None
+                and total_actual > total_anterior
+            )
+
+            ultima_reconciliacion = cargar_ultima_actualizacion_completa()
+            ahora = datetime.now(ZONA_COLOMBIA)
+            tiempo_desde_reconciliacion = (
+                (ahora - ultima_reconciliacion).total_seconds()
+                if ultima_reconciliacion else None
+            )
+            toca_reconciliacion_completa = (
+                tiempo_desde_reconciliacion is None
+                or tiempo_desde_reconciliacion >= INTERVALO_RECONCILIACION_SEGUNDOS
+            )
+
+            if hay_posibles_nuevas or toca_reconciliacion_completa:
+                resultado = ejecutar_vigilante(notificar_siempre=False)
+                with lock_estado_vigilante:
+                    estado_vigilante_automatico["ultima_ejecucion"] = ahora.isoformat()
+                    estado_vigilante_automatico["ultimo_resultado"] = resultado
+                    estado_vigilante_automatico["ejecuciones"] += 1
+                motivo = (
+                    f"posible(s) plaza(s) nueva(s) (mapa {total_anterior}->{total_actual})"
+                    if hay_posibles_nuevas else "reconciliación periódica"
+                )
+                print(f"🔍 Chequeo completo ejecutado ({motivo}): {resultado}")
+            else:
+                print(f"🟢 Chequeo liviano: sin novedades en el total del mapa ({total_actual}). Se omite scrape completo.")
         except Exception as e:
             print(f"⚠️ Error en hilo vigilante automático: {e}")
         finally:
@@ -667,12 +775,16 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
                 print(f"⚠️ Error scraping {depto}: {e}")
                 continue  # scrape falló/parcial: NO reconciliar este depto
 
-            total_antes = len(plazas_bd)
-            plazas_bd, ids_nuevas_depto = fusionar_plazas_reconciliando(
+            plazas_bd, ids_nuevas_depto, eliminadas, fue_sospechosa = fusionar_departamento_con_salvaguarda(
                 plazas_bd, plazas_depto, depto
             )
-            eliminadas = total_antes + len(plazas_depto) - len(plazas_bd) - len(ids_nuevas_depto)
-            if eliminadas > 0:
+            if fue_sospechosa:
+                print(
+                    f"⚠️ Caída sospechosa en '{depto}': llegaron muchas menos plazas de "
+                    f"las esperadas (posible scrape parcial/ViewState roto). Se omitió "
+                    f"la reconciliación de este departamento (no se eliminó nada)."
+                )
+            elif eliminadas > 0:
                 total_fantasmas_eliminadas += eliminadas
                 print(f"🗑️ Reconciliación '{depto}': {eliminadas} plaza(s) fantasma eliminada(s)")
 
@@ -1177,6 +1289,7 @@ def status():
     with lock_estado_vigilante:
         return {
             "intervalo_segundos": INTERVALO_VIGILANTE_SEGUNDOS,
+            "intervalo_reconciliacion_segundos": INTERVALO_RECONCILIACION_SEGUNDOS,
             "ultima_ejecucion": estado_vigilante_automatico["ultima_ejecucion"],
             "ultimo_resultado": estado_vigilante_automatico["ultimo_resultado"],
             "ejecuciones_desde_arranque": estado_vigilante_automatico["ejecuciones"],
@@ -1662,7 +1775,10 @@ def obtener_departamentos():
 def agregar_departamento():
     """
     Agrega todas las vacantes de un departamento al JSON, reconciliando
-    (elimina fantasmas que ya no aparezcan en este departamento).
+    (elimina fantasmas que ya no aparezcan en este departamento), salvo que
+    el scrape haya traído sospechosamente pocas plazas frente a lo ya
+    guardado, en cuyo caso se hace un merge aditivo (ver
+    fusionar_departamento_con_salvaguarda).
     """
     try:
         data = request.get_json()
@@ -1680,7 +1796,7 @@ def agregar_departamento():
             return {"error": f"No se encontraron plazas para '{departamento_nombre}'."}, 404
 
         plazas_bd = cargar_datos_anteriores()
-        plazas_fusionadas, ids_nuevas = fusionar_plazas_reconciliando(
+        plazas_fusionadas, ids_nuevas, eliminadas, fue_sospechosa = fusionar_departamento_con_salvaguarda(
             plazas_bd, plazas_departamento, departamento_nombre
         )
         guardar_datos_actuales(plazas_fusionadas)
@@ -1691,8 +1807,12 @@ def agregar_departamento():
         except Exception as e:
             print(f"Error al actualizar total_mapa: {e}")
 
+        mensaje = f"✅ Se procesaron {len(plazas_departamento)} plazas de '{departamento_nombre}'"
+        if fue_sospechosa:
+            mensaje += " (⚠️ caída sospechosa frente a lo guardado: no se eliminó nada, solo se agregó/actualizó)"
+
         return {
-            "mensaje": f"✅ Se procesaron {len(plazas_departamento)} plazas de '{departamento_nombre}'",
+            "mensaje": mensaje,
             "plazas_encontradas": len(plazas_departamento),
             "total_plazas_en_json": len(plazas_fusionadas),
             "plazas_nuevas": len(ids_nuevas),
