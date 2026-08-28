@@ -519,12 +519,54 @@ def obtener_departamentos_en_json():
             departamentos.add(depto)
     return sorted(departamentos)
 
+def fusionar_plazas_reconciliando(plazas_bd, plazas_scrapeadas, departamento):
+    """
+    Igual que fusionar_plazas, pero además ELIMINA del JSON las plazas de
+    `departamento` que estaban guardadas pero ya no aparecieron en el
+    scrape actual (se cerraron/removieron antes de su fecha de cierre).
+    Solo úsala cuando tengas la garantía de que el scrape trajo TODAS
+    las plazas actuales de ese departamento (sin errores a mitad de camino).
+    """
+    ids_scrapeadas = {p["id"] for p in plazas_scrapeadas}
+
+    # Todo lo que NO es de este departamento se conserva tal cual
+    conservadas = [p for p in plazas_bd if p.get("departamento") != departamento]
+
+    # De lo que SÍ es de este departamento, solo mantenemos lo que sigue
+    # apareciendo en el scrape actual
+    bd_depto_por_id = {
+        p["id"]: p for p in plazas_bd
+        if p.get("departamento") == departamento and p["id"] in ids_scrapeadas
+    }
+
+    ids_nuevas = set()
+    for p in plazas_scrapeadas:
+        if p["id"] in bd_depto_por_id:
+            bd_depto_por_id[p["id"]].update(p)
+        else:
+            bd_depto_por_id[p["id"]] = dict(p)
+            ids_nuevas.add(p["id"])
+
+    resultado = conservadas + list(bd_depto_por_id.values())
+    return resultado, ids_nuevas
+
+
 def actualizar_postulados_departamento(nombre_departamento):
     plazas_scrapeadas = obtener_vacantes_por_departamento(nombre_departamento)
     with lock_json:
         plazas_bd = cargar_datos_anteriores()
-        plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, plazas_scrapeadas)
+        total_antes = len([p for p in plazas_bd if p.get("departamento") == nombre_departamento])
+
+        plazas_bd, ids_nuevas = fusionar_plazas_reconciliando(
+            plazas_bd, plazas_scrapeadas, nombre_departamento
+        )
         guardar_datos_actuales(plazas_bd)
+
+        total_despues = len([p for p in plazas_bd if p.get("departamento") == nombre_departamento])
+        eliminadas = total_antes - total_despues + len(ids_nuevas)
+        if eliminadas > 0:
+            print(f"🗑️ Reconciliación {nombre_departamento}: {eliminadas} plaza(s) fantasma eliminada(s)")
+
     return len(plazas_scrapeadas), len(ids_nuevas)
 
 def hilo_actualizador_postulados():
@@ -624,21 +666,32 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
         total_mapa = obtener_total_plazas_mapa()
         total_mapa_anterior = cargar_total_mapa_anterior()
 
-        # 4. SCRAPING COMPLETO SIEMPRE
+        # 4. SCRAPING COMPLETO SIEMPRE (con reconciliación por departamento)
         print("🔄 Ejecutando scraping completo de todos los departamentos...")
         deptos_mapa = obtener_departamentos_del_mapa()
-        nuevas_plazas_totales = []
+        ids_nuevas_totales = set()
+
         for depto in deptos_mapa:
             try:
                 plazas_depto = obtener_vacantes_por_departamento(depto)
-                nuevas_plazas_totales.extend(plazas_depto)
+                total_antes_depto = len([p for p in plazas_bd if p.get("departamento") == depto])
+
+                plazas_bd, ids_nuevas_depto = fusionar_plazas_reconciliando(
+                    plazas_bd, plazas_depto, depto
+                )
+                ids_nuevas_totales |= ids_nuevas_depto
+
+                total_despues_depto = len([p for p in plazas_bd if p.get("departamento") == depto])
+                eliminadas_depto = total_antes_depto - total_despues_depto + len(ids_nuevas_depto)
+                if eliminadas_depto > 0:
+                    print(f"🗑️ Reconciliación {depto}: {eliminadas_depto} plaza(s) fantasma eliminada(s)")
             except Exception as e:
                 print(f"⚠️ Error scraping {depto}: {e}")
-        # Fusionar con JSON actual
-        plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, nuevas_plazas_totales)
+
         guardar_datos_actuales(plazas_bd)
         guardar_ultima_actualizacion_completa(datetime.now(ZONA_COLOMBIA))
         total_json_actual = len(plazas_bd)
+        ids_nuevas = ids_nuevas_totales
 
         # 5. Detectar cambios (nuevas, eliminadas, actualizadas)
         cambios = detectar_cambios_completos(plazas_bd, plazas_antes)
@@ -1839,7 +1892,9 @@ def agregar_departamento():
             return {"error": f"No se encontraron plazas para '{departamento_nombre}'."}, 404
 
         plazas_bd = cargar_datos_anteriores()
-        plazas_fusionadas, ids_nuevas = fusionar_plazas(plazas_bd, plazas_departamento)
+        plazas_fusionadas, ids_nuevas = fusionar_plazas_reconciliando(
+            plazas_bd, plazas_departamento, departamento_nombre
+        )
         guardar_datos_actuales(plazas_fusionadas)
 
         try:
