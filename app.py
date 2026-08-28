@@ -126,21 +126,13 @@ FILAS_POR_PAGINA = 6
 INTERVALO_ACTUALIZACION_POSTULADOS = int(os.environ.get("INTERVALO_ACTUALIZACION_POSTULADOS", 600))
 
 # ========== HILO VIGILANTE AUTOMÁTICO (reemplaza al Cron Job externo) ==========
+# Antes esto dependía de un Cron Job de Render pegándole a /check cada minuto.
+# Si ese cron se desconfigura, cambia de URL, o el plan no lo soporta, dejas
+# de recibir notificaciones automáticas sin enterarte. Este hilo corre DENTRO
+# del propio proceso, así que mientras la app esté viva, se ejecuta solo.
 INTERVALO_VIGILANTE_SEGUNDOS = int(os.environ.get("INTERVALO_VIGILANTE_SEGUNDOS", 60))
 
-# Cada cuánto se fuerza un scrape completo (con posible eliminación de
-# plazas) aunque el chequeo liviano no haya detectado un aumento del total.
-# Esto es lo que detecta plazas cerradas/llenadas cuando el total del mapa
-# no sube (p. ej. se cierra una y se abre otra en el mismo ciclo).
-INTERVALO_RECONCILIACION_SEGUNDOS = int(os.environ.get("INTERVALO_RECONCILIACION_SEGUNDOS", 900))
-
-# Salvaguarda contra scrapes parciales/rotos: si al reconciliar un
-# departamento llegan muchas menos plazas de las que ya teníamos guardadas,
-# asumimos que el scrape falló a medias (ViewState roto, timeout, etc.) y
-# NO borramos nada de ese departamento en esa corrida.
-UMBRAL_CAIDA_SOSPECHOSA = float(os.environ.get("UMBRAL_CAIDA_SOSPECHOSA", 0.5))
-MIN_PLAZAS_PARA_SOSPECHA = int(os.environ.get("MIN_PLAZAS_PARA_SOSPECHA", 3))
-
+# Guarda info del último chequeo automático, útil para /status.
 estado_vigilante_automatico = {
     "ultima_ejecucion": None,
     "ultimo_resultado": None,
@@ -150,9 +142,15 @@ lock_estado_vigilante = threading.Lock()
 
 lock_json = threading.RLock()
 
+# Nombre del bot (para reconocer menciones tipo "@VigilanteSistemaMaestroBot Actualizar").
 TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "VigilanteSistemaMaestroBot")
+
+# Token secreto opcional para verificar que las peticiones al webhook realmente
+# vienen de Telegram (se configura al registrar el webhook, ver instrucciones
+# más abajo). Si no se define, no se valida (no recomendado en producción).
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 
+# Evita que dos "Actualizar" simultáneos disparen dos scrapeos completos a la vez.
 lock_ejecucion_vigilante = threading.Lock()
 
 # ============================================================
@@ -319,6 +317,11 @@ def expandir_todos_detalles(session, viewstate, html_actual):
             source_id: source_id,
             "form-busqueda": "form-busqueda",
             "javax.faces.ViewState": viewstate,
+            # Incluir otros campos que puedan ser necesarios (filtros, etc.)
+            # Se pueden extraer del HTML actual, pero para simplificar usamos los mismos
+            # que enviamos en la paginación. Como no los tenemos aquí, podemos dejar
+            # solo los esenciales; en la práctica, el servidor a menudo acepta esto.
+            # Para mayor robustez, extraemos todos los inputs ocultos del formulario.
         }
 
         # Extraer inputs ocultos del formulario actual (para mantener estado)
@@ -438,6 +441,7 @@ def pedir_pagina_filtrada(session, viewstate, first, rows, codigo_departamento):
         return html_expandido, nuevo_viewstate
     except Exception as e:
         print(f"⚠️ Error al expandir detalles en página {first//rows + 1}: {e}")
+        # En caso de error, devolvemos el HTML original y el viewstate actualizado
         return html_frag, nuevo_viewstate
 
 def obtener_vacantes_por_departamento(nombre_departamento):
@@ -493,13 +497,6 @@ def obtener_departamentos_del_mapa():
 def fusionar_plazas(plazas_bd, plazas_scrapeadas):
     """
     Combina la base de datos persistente con lo que se scrapea.
-
-    ⚠️ NOTA: Esta función es PURAMENTE ADITIVA. Nunca elimina una plaza que
-    ya no aparezca en lo scrapeado. Úsala solo cuando `plazas_scrapeadas`
-    sea un subconjunto parcial (por ejemplo, un solo `/agregar-departamento`
-    inicial) donde no tienes certeza de cobertura total. Para reconciliar
-    un departamento completo (agregar Y eliminar fantasmas), usa
-    `fusionar_plazas_reconciliando`.
     """
     bd_por_id = {p["id"]: dict(p) for p in plazas_bd}
     ids_nuevas = set()
@@ -510,79 +507,6 @@ def fusionar_plazas(plazas_bd, plazas_scrapeadas):
             bd_por_id[p["id"]] = dict(p)
             ids_nuevas.add(p["id"])
     return list(bd_por_id.values()), ids_nuevas
-
-def fusionar_plazas_reconciliando(plazas_bd, plazas_scrapeadas, departamento):
-    """
-    Igual que fusionar_plazas, pero además RECONCILIA el departamento dado:
-    elimina del JSON las plazas de ese departamento que estaban guardadas
-    pero ya no aparecieron en el scrape actual (se cerraron, se llenaron o
-    se retiraron antes de su fecha de cierre programada).
-
-    Esto corrige el desfase "mapa: X plazas / JSON: Y plazas" que aparece
-    cuando una vacante desaparece del sitio sin haber llegado a su fecha
-    de cierre: fusionar_plazas() nunca la habría borrado.
-
-    ⚠️ Solo debe usarse cuando `plazas_scrapeadas` representa el scrape
-    COMPLETO y exitoso de `departamento` (todas sus páginas, sin cortes
-    por excepción). Si el scrape fue parcial o falló a mitad de camino,
-    usar esta función borraría plazas válidas.
-
-    En la práctica, se recomienda llamar a esta función a través de
-    `fusionar_departamento_con_salvaguarda`, que verifica antes si el
-    número de plazas scrapeadas cayó sospechosamente respecto a lo ya
-    guardado (indicio de scrape parcial) y evita la reconciliación en
-    ese caso.
-    """
-    ids_scrapeadas = {p["id"] for p in plazas_scrapeadas}
-
-    # Todo lo que NO es de este departamento se conserva intacto
-    conservadas = [p for p in plazas_bd if p.get("departamento") != departamento]
-
-    # De lo que SÍ es de este departamento, solo mantenemos lo que sigue
-    # apareciendo en el scrape actual (esto es lo que elimina fantasmas)
-    bd_depto_por_id = {
-        p["id"]: dict(p) for p in plazas_bd
-        if p.get("departamento") == departamento and p["id"] in ids_scrapeadas
-    }
-
-    ids_nuevas = set()
-    for p in plazas_scrapeadas:
-        if p["id"] in bd_depto_por_id:
-            bd_depto_por_id[p["id"]].update(p)
-        else:
-            bd_depto_por_id[p["id"]] = dict(p)
-            ids_nuevas.add(p["id"])
-
-    resultado = conservadas + list(bd_depto_por_id.values())
-    return resultado, ids_nuevas
-
-def fusionar_departamento_con_salvaguarda(plazas_bd, plazas_scrapeadas, departamento):
-    """
-    Fusiona las plazas scrapeadas de `departamento` en `plazas_bd`.
-
-    Antes de reconciliar (que puede ELIMINAR plazas que ya no aparecieron
-    en el scrape), compara cuántas plazas de ese departamento había ya
-    guardadas contra cuántas trajo este scrape. Si la caída es demasiado
-    grande, se asume que el scrape fue parcial/roto (ViewState vencido,
-    timeout, sesión cortada, etc.) y se hace un merge PURAMENTE ADITIVO
-    (sin borrar nada), para no generar eliminaciones fantasma.
-
-    Devuelve: (nueva_bd, ids_nuevas, cantidad_eliminadas, fue_caida_sospechosa)
-    """
-    conteo_actual = sum(1 for p in plazas_bd if p.get("departamento") == departamento)
-    caida_sospechosa = (
-        conteo_actual >= MIN_PLAZAS_PARA_SOSPECHA
-        and len(plazas_scrapeadas) < conteo_actual * UMBRAL_CAIDA_SOSPECHOSA
-    )
-
-    if caida_sospechosa:
-        nueva_bd, ids_nuevas = fusionar_plazas(plazas_bd, plazas_scrapeadas)
-        return nueva_bd, ids_nuevas, 0, True
-
-    total_antes = len(plazas_bd)
-    nueva_bd, ids_nuevas = fusionar_plazas_reconciliando(plazas_bd, plazas_scrapeadas, departamento)
-    eliminadas = total_antes + len(plazas_scrapeadas) - len(nueva_bd) - len(ids_nuevas)
-    return nueva_bd, ids_nuevas, max(eliminadas, 0), False
 
 # ========== HILO: REFRESCO DE POSTULADOS POR DEPARTAMENTO ==========
 
@@ -599,13 +523,7 @@ def actualizar_postulados_departamento(nombre_departamento):
     plazas_scrapeadas = obtener_vacantes_por_departamento(nombre_departamento)
     with lock_json:
         plazas_bd = cargar_datos_anteriores()
-        plazas_bd, ids_nuevas, eliminadas, fue_sospechosa = fusionar_departamento_con_salvaguarda(
-            plazas_bd, plazas_scrapeadas, nombre_departamento
-        )
-        if fue_sospechosa:
-            print(f"⚠️ Caída sospechosa en '{nombre_departamento}' (hilo de postulados): se omitió la reconciliación (no se eliminó nada).")
-        elif eliminadas > 0:
-            print(f"🗑️ Reconciliación '{nombre_departamento}': {eliminadas} plaza(s) fantasma eliminada(s)")
+        plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, plazas_scrapeadas)
         guardar_datos_actuales(plazas_bd)
     return len(plazas_scrapeadas), len(ids_nuevas)
 
@@ -634,87 +552,29 @@ def hilo_actualizador_postulados():
             print(f"⚠️ Error en hilo actualizador de postulados: {e}")
         time.sleep(INTERVALO_ACTUALIZACION_POSTULADOS)
 
-def chequeo_liviano_total_mapa():
-    """
-    Chequeo barato: UNA sola petición HTTP sin sesión ni expansión de
-    detalles, que cuenta cuántos marcadores de plaza hay en el mapa.
-    Se usa para decidir si vale la pena disparar el scrape completo
-    (pesado) antes de que toque la reconciliación periódica.
-
-    Devuelve (total_actual, total_anterior) o (None, total_anterior) si
-    falla la petición.
-    """
-    total_anterior = cargar_total_mapa_anterior()
-    try:
-        total_actual = obtener_total_plazas_mapa()
-    except Exception as e:
-        print(f"⚠️ Error en chequeo liviano del mapa: {e}")
-        return None, total_anterior
-    return total_actual, total_anterior
-
 def hilo_vigilante_automatico():
     """
-    Reemplaza al Cron Job externo. En cada ciclo (cada
-    INTERVALO_VIGILANTE_SEGUNDOS) hace primero un chequeo LIVIANO (una sola
-    petición HTTP) comparando el total de plazas del mapa contra el último
-    total conocido:
-
-      - Si el total SUBIÓ  -> dispara de inmediato el scrape completo
-        (ejecutar_vigilante), para detectar y notificar la(s) plaza(s)
-        nueva(s) casi al instante.
-      - Si no subió pero ya pasó INTERVALO_RECONCILIACION_SEGUNDOS desde
-        la última reconciliación completa -> también dispara el scrape
-        completo, para detectar cierres/plazas llenas.
-      - En cualquier otro caso -> no hace scrape pesado en este ciclo.
-
-    Esto evita estar golpeando el sitio con un scrape completo (con
-    expansión de detalle por cada vacante) cada 60 segundos, que es lo que
-    generaba ViewStates rotos, scrapes parciales, y por lo tanto,
-    eliminaciones "fantasma" falsas.
+    Reemplaza al Cron Job externo: corre ejecutar_vigilante() cada
+    INTERVALO_VIGILANTE_SEGUNDOS (por defecto 60s) directamente dentro del
+    proceso de la app, sin depender de que algo de afuera llame a /check.
     """
-    print(
-        f"🧵 Hilo vigilante automático iniciado (chequeo liviano cada "
-        f"{INTERVALO_VIGILANTE_SEGUNDOS}s, reconciliación completa cada "
-        f"{INTERVALO_RECONCILIACION_SEGUNDOS}s o antes si sube el total)."
-    )
+    print(f"🧵 Hilo vigilante automático iniciado (cada {INTERVALO_VIGILANTE_SEGUNDOS}s).")
+    # Pequeña espera inicial para dejar que la app termine de levantar.
     time.sleep(5)
     while True:
         adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
         if not adquirido:
+            # Ya hay una ejecución en curso (p. ej. alguien escribió "Actualizar"
+            # justo en este momento); nos saltamos este ciclo.
             time.sleep(INTERVALO_VIGILANTE_SEGUNDOS)
             continue
         try:
-            total_actual, total_anterior = chequeo_liviano_total_mapa()
-            hay_posibles_nuevas = (
-                total_actual is not None
-                and total_anterior is not None
-                and total_actual > total_anterior
-            )
-
-            ultima_reconciliacion = cargar_ultima_actualizacion_completa()
-            ahora = datetime.now(ZONA_COLOMBIA)
-            tiempo_desde_reconciliacion = (
-                (ahora - ultima_reconciliacion).total_seconds()
-                if ultima_reconciliacion else None
-            )
-            toca_reconciliacion_completa = (
-                tiempo_desde_reconciliacion is None
-                or tiempo_desde_reconciliacion >= INTERVALO_RECONCILIACION_SEGUNDOS
-            )
-
-            if hay_posibles_nuevas or toca_reconciliacion_completa:
-                resultado = ejecutar_vigilante(notificar_siempre=False)
-                with lock_estado_vigilante:
-                    estado_vigilante_automatico["ultima_ejecucion"] = ahora.isoformat()
-                    estado_vigilante_automatico["ultimo_resultado"] = resultado
-                    estado_vigilante_automatico["ejecuciones"] += 1
-                motivo = (
-                    f"posible(s) plaza(s) nueva(s) (mapa {total_anterior}->{total_actual})"
-                    if hay_posibles_nuevas else "reconciliación periódica"
-                )
-                print(f"🔍 Chequeo completo ejecutado ({motivo}): {resultado}")
-            else:
-                print(f"🟢 Chequeo liviano: sin novedades en el total del mapa ({total_actual}). Se omite scrape completo.")
+            resultado = ejecutar_vigilante(notificar_siempre=False)
+            with lock_estado_vigilante:
+                estado_vigilante_automatico["ultima_ejecucion"] = datetime.now(ZONA_COLOMBIA).isoformat()
+                estado_vigilante_automatico["ultimo_resultado"] = resultado
+                estado_vigilante_automatico["ejecuciones"] += 1
+            print(f"🔍 Chequeo automático: {resultado}")
         except Exception as e:
             print(f"⚠️ Error en hilo vigilante automático: {e}")
         finally:
@@ -767,27 +627,15 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
         # 4. SCRAPING COMPLETO SIEMPRE
         print("🔄 Ejecutando scraping completo de todos los departamentos...")
         deptos_mapa = obtener_departamentos_del_mapa()
-        total_fantasmas_eliminadas = 0
+        nuevas_plazas_totales = []
         for depto in deptos_mapa:
             try:
                 plazas_depto = obtener_vacantes_por_departamento(depto)
+                nuevas_plazas_totales.extend(plazas_depto)
             except Exception as e:
                 print(f"⚠️ Error scraping {depto}: {e}")
-                continue  # scrape falló/parcial: NO reconciliar este depto
-
-            plazas_bd, ids_nuevas_depto, eliminadas, fue_sospechosa = fusionar_departamento_con_salvaguarda(
-                plazas_bd, plazas_depto, depto
-            )
-            if fue_sospechosa:
-                print(
-                    f"⚠️ Caída sospechosa en '{depto}': llegaron muchas menos plazas de "
-                    f"las esperadas (posible scrape parcial/ViewState roto). Se omitió "
-                    f"la reconciliación de este departamento (no se eliminó nada)."
-                )
-            elif eliminadas > 0:
-                total_fantasmas_eliminadas += eliminadas
-                print(f"🗑️ Reconciliación '{depto}': {eliminadas} plaza(s) fantasma eliminada(s)")
-
+        # Fusionar con JSON actual
+        plazas_bd, ids_nuevas = fusionar_plazas(plazas_bd, nuevas_plazas_totales)
         guardar_datos_actuales(plazas_bd)
         guardar_ultima_actualizacion_completa(datetime.now(ZONA_COLOMBIA))
         total_json_actual = len(plazas_bd)
@@ -798,8 +646,7 @@ def ejecutar_vigilante(notificar_siempre=False, chat_id=None):
         hay_cambios = (cambios["total_nuevas"] > 0 or
                        cambios["total_eliminadas"] > 0 or
                        # cambios["total_actualizadas"] > 0 or
-                       len(plazas_vencidas) > 0 or
-                       total_fantasmas_eliminadas > 0)
+                       len(plazas_vencidas) > 0)
 
         debe_notificar = hay_cambios or notificar_siempre
 
@@ -904,6 +751,7 @@ def detectar_cambios_completos(plazas_actuales, plazas_anteriores):
     eliminadas = []
     actualizadas = []
 
+    # Detectar nuevas y actualizadas
     for id_plaza, p_actual in actuales_por_id.items():
         if id_plaza not in anteriores_por_id:
             nuevas.append(p_actual)
@@ -918,6 +766,7 @@ def detectar_cambios_completos(plazas_actuales, plazas_anteriores):
                     "postulados_actual": p_actual["postulados"]
                 })
 
+    # Detectar eliminadas
     for id_plaza, p_anterior in anteriores_por_id.items():
         if id_plaza not in actuales_por_id:
             eliminadas.append(p_anterior)
@@ -932,6 +781,10 @@ def detectar_cambios_completos(plazas_actuales, plazas_anteriores):
     }
 
 def obtener_departamentos_pendientes():
+    """
+    Devuelve una lista con los nombres de los departamentos que tienen
+    plazas en el mapa pero no están completas en el JSON.
+    """
     deptos_mapa = obtener_departamentos_del_mapa()
     plazas_json = cargar_datos_anteriores()
     contador_json = defaultdict(int)
@@ -957,7 +810,50 @@ def obtener_departamentos_pendientes():
             pendientes.append(nombre_depto)
     return pendientes
 
+def detectar_cambios(plazas_actuales, plazas_anteriores):
+    """
+    Compara dos listas de plazas y detecta:
+    - nuevas: plazas que no estaban en la versión anterior.
+    - actualizadas: plazas cuyo postulados cambiaron.
+    - sin_cambios: plazas que no cambiaron.
+    """
+    anteriores_por_id = {p["id"]: p for p in plazas_anteriores}
+    actuales_por_id = {p["id"]: p for p in plazas_actuales}
+
+    nuevas = []
+    actualizadas = []
+    sin_cambios = []
+
+    for id_plaza, p_actual in actuales_por_id.items():
+        if id_plaza not in anteriores_por_id:
+            nuevas.append(p_actual)
+        else:
+            p_anterior = anteriores_por_id[id_plaza]
+            if p_actual["postulados"] != p_anterior["postulados"]:
+                actualizadas.append({
+                    "id": id_plaza,
+                    "departamento": p_actual["departamento"],
+                    "area": p_actual["area"],
+                    "postulados_anterior": p_anterior["postulados"],
+                    "postulados_actual": p_actual["postulados"]
+                })
+            else:
+                sin_cambios.append(p_actual)
+
+    return {
+        "nuevas": nuevas,
+        "actualizadas": actualizadas,
+        "sin_cambios": sin_cambios,
+        "total_nuevas": len(nuevas),
+        "total_actualizadas": len(actualizadas)
+    }
+
 def contar_plazas_por_activacion(plazas):
+    """
+    Recorre la lista de plazas y cuenta cuántas tienen su fecha de activación
+    (cierre - 24h) en el día de hoy y en el día de ayer (zona horaria Colombia).
+    Retorna (hoy, ayer).
+    """
     ahora = datetime.now(ZONA_COLOMBIA)
     hoy = ahora.date()
     ayer = hoy - timedelta(days=1)
@@ -976,7 +872,86 @@ def contar_plazas_por_activacion(plazas):
 
     return contador_hoy, contador_ayer
 
+def construir_resumen(plazas_bd, plazas_scrapeadas, total_mapa, ids_nuevas=None, total_mapa_anterior=None):
+    """
+    Construye el mensaje para Telegram.
+    """
+    ids_nuevas = ids_nuevas or set()
+
+    total_hoy_json, total_ayer_calculado = contar_plazas_por_activacion(plazas_bd)
+
+    deptos = defaultdict(list)
+    for p in plazas_bd:
+        deptos[p["departamento"]].append(p)
+
+    lineas = []
+    lineas.append("🚨 <b>¡Plazas Sistema Maestro!</b> 🚨")
+    lineas.append("")
+
+    if total_mapa_anterior is not None:
+        diferencia = total_mapa - total_mapa_anterior
+        if diferencia > 0:
+            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>(+{diferencia})</b> ⬆️")
+        elif diferencia < 0:
+            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>({diferencia})</b> ⬇️")
+        else:
+            lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} ↔️")
+    else:
+        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa}")
+
+    lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy_json}")
+    lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer_calculado}")
+
+    lineas.append("")
+    lineas.append("--- <b>TODAS LAS PLAZAS</b> ---")
+    lineas.append("")
+
+    plazas_anteriores = cargar_datos_anteriores()
+    anteriores_por_id = {p["id"]: p for p in plazas_anteriores}
+
+    for depto in sorted(deptos.keys()):
+        lineas.append(f"📌 <b>{html.escape(depto)}</b>")
+        for p in sorted(deptos[depto], key=lambda x: x["area"]):
+            es_nueva = p["id"] in ids_nuevas
+
+            cambio = None
+            if not es_nueva and p["id"] in anteriores_por_id:
+                anterior = anteriores_por_id[p["id"]]
+                if p["postulados"] != anterior["postulados"]:
+                    cambio = (anterior["postulados"], p["postulados"])
+
+            area_esc = html.escape(abreviar_area(p["area"]))
+            municipio_esc = html.escape(p["municipio"])
+            zona_esc = html.escape(p["zona_tipo"])
+
+            if es_nueva:
+                linea = f"  • {area_esc} ({municipio_esc} - {zona_esc}) 🆕 – {p['postulados']} postulados"
+            else:
+                flecha = ""
+                if cambio:
+                    if cambio[1] > cambio[0]:
+                        flecha = " ↑"
+                    elif cambio[1] < cambio[0]:
+                        flecha = " ↓"
+                linea = f"  • {area_esc} ({municipio_esc}){flecha} – {p['postulados']} postulados"
+
+            lineas.append(linea)
+        lineas.append("")
+
+    lineas.append("")
+    lineas.append(f'🔗 <a href="{URL_PAGINA}">Ir a la página Sistema Maestro</a>')
+
+    return "\n".join(lineas)
+
 def enviar_telegram(mensaje, chat_id=None):
+    """
+    Envía un mensaje a Telegram, dividiéndolo en varias partes si supera
+    el límite de 4096 caracteres que impone la API de Telegram, y
+    registrando en logs cualquier error HTTP.
+
+    chat_id: chat destino. Si no se especifica, se usa el TELEGRAM_CHAT_ID
+    configurado por defecto.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     LIMITE = 4000
     destino = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
@@ -993,6 +968,10 @@ def enviar_telegram(mensaje, chat_id=None):
             print(f"⚠️ Error Telegram (parte {i}/{len(partes)}): {e}")
 
 def _dividir_mensaje(mensaje, limite):
+    """
+    Divide un mensaje largo en partes que no superen `limite` caracteres,
+    intentando cortar por líneas completas para no romper el HTML a la mitad.
+    """
     lineas = mensaje.split("\n")
     partes = []
     actual = ""
@@ -1022,6 +1001,8 @@ def _dividir_mensaje(mensaje, limite):
 
 # ========== MENÚ INTERACTIVO POR TELEGRAM (Departamento / Áreas) ==========
 
+# Guarda, por chat_id, en qué paso del menú está esa conversación:
+# {"tipo": "menu_principal" | "departamento_lista" | "area_lista", "opciones": [...]}
 lock_estados_menu = threading.Lock()
 estados_menu_chat = {}
 
@@ -1043,6 +1024,11 @@ def filtrar_plazas_por_area(nombre_area):
     return [p for p in plazas if (p.get("area") or "").strip() == nombre_area]
 
 def construir_resumen_filtrado(plazas_filtradas, encabezado=None):
+    """
+    Igual que construir_resumen, pero para un subconjunto ya filtrado
+    (por departamento o por área). El total mostrado es el del subconjunto,
+    no el total general del mapa.
+    """
     total_hoy, total_ayer = contar_plazas_por_activacion(plazas_filtradas)
 
     deptos = defaultdict(list)
@@ -1079,6 +1065,11 @@ def construir_resumen_filtrado(plazas_filtradas, encabezado=None):
     return "\n".join(lineas)
 
 def _es_comando_menu(texto):
+    """
+    Determina si el texto equivale al comando "Menú" (con las mismas
+    tolerancias que _es_comando_actualizar: mayúsculas/minúsculas,
+    mención al bot, y forma de comando "/menu").
+    """
     if not texto:
         return False
 
@@ -1133,6 +1124,14 @@ def _enviar_lista_areas(chat_id):
     enviar_telegram("\n".join(lineas), chat_id=chat_id)
 
 def _procesar_seleccion_menu(chat_id, texto):
+    """
+    Si este chat tiene un menú pendiente (menú principal, lista de
+    departamentos o lista de áreas) y el texto recibido es un número,
+    procesa la selección y responde. Devuelve True si consumió el mensaje
+    como parte del flujo del menú; False si no había menú pendiente o el
+    texto no era una selección válida (para no interferir con otros
+    comandos, como "Actualizar").
+    """
     with lock_estados_menu:
         estado = estados_menu_chat.get(chat_id)
 
@@ -1184,6 +1183,13 @@ def _procesar_seleccion_menu(chat_id, texto):
 # ========== COMANDO "Actualizar" DESDE TELEGRAM (WEBHOOK) ==========
 
 def _es_comando_actualizar(texto):
+    """
+    Determina si el texto de un mensaje de Telegram equivale al comando
+    "Actualizar", tolerando:
+      - Mayúsculas/minúsculas ("actualizar", "ACTUALIZAR", "Actualizar")
+      - Mención al bot delante ("@VigilanteSistemaMaestroBot Actualizar")
+      - Forma de comando ("/actualizar", "/actualizar@VigilanteSistemaMaestroBot")
+    """
     if not texto:
         return False
 
@@ -1200,6 +1206,11 @@ def _es_comando_actualizar(texto):
     return False
 
 def _procesar_comando_actualizar(chat_id):
+    """
+    Se ejecuta en un hilo aparte (para no bloquear la respuesta al webhook
+    de Telegram, que espera un 200 OK rápido). Corre ejecutar_vigilante()
+    forzando notificación y respondiendo al chat que escribió "Actualizar".
+    """
     adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
     if not adquirido:
         enviar_telegram(
@@ -1218,6 +1229,16 @@ def _procesar_comando_actualizar(chat_id):
 
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
+    """
+    Endpoint que Telegram llama cada vez que hay un mensaje nuevo en un chat
+    donde está el bot (una vez configurado el webhook, ver instrucciones al
+    final del archivo).
+
+    Si el texto del mensaje es "Actualizar" (con las variantes toleradas en
+    _es_comando_actualizar) -- venga de CUALQUIER usuario/chat -- dispara
+    ejecutar_vigilante() en un hilo aparte y responde de inmediato 200 OK a
+    Telegram para no generar timeouts.
+    """
     if TELEGRAM_WEBHOOK_SECRET:
         secreto_recibido = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if secreto_recibido != TELEGRAM_WEBHOOK_SECRET:
@@ -1251,6 +1272,12 @@ def telegram_webhook():
 
 @app.route("/set-webhook")
 def set_webhook():
+    """
+    Endpoint de conveniencia: registra la URL pública de este servicio como
+    webhook de Telegram, para no tener que llamar la API a mano con curl.
+    Visítala UNA VEZ desde el navegador después de desplegar
+    (ej: https://tu-app.onrender.com/set-webhook).
+    """
     url_publica = request.host_url.rstrip("/") + "/telegram-webhook"
     url_api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
     try:
@@ -1263,10 +1290,12 @@ def set_webhook():
 
 @app.route("/check")
 def check():
+    # 1. Intentar adquirir el lock SIN bloquear (igual que en tu código original)
     adquirido = lock_ejecucion_vigilante.acquire(blocking=False)
     if not adquirido:
-        return {"resultado": "Ya hay una ejecución en curso, se omitió este chequeo."}, 409
+        return {"resultado": "Ya hay una ejecución en curso, se omitió este chequeo."}, 409  # Conflict
 
+    # 2. Lanzar un hilo que ejecute la tarea y, al terminar, libere el lock
     def tarea_con_lock():
         try:
             ejecutar_vigilante(notificar_siempre=False)
@@ -1277,6 +1306,7 @@ def check():
 
     threading.Thread(target=tarea_con_lock, daemon=True).start()
 
+    # 3. Responder inmediatamente para que cron-job.org no haga timeout
     return {"resultado": "Tarea iniciada en segundo plano"}, 202
 
 @app.route("/check-force")
@@ -1286,10 +1316,13 @@ def check_force():
 
 @app.route("/status")
 def status():
+    """
+    Endpoint rápido para confirmar que el hilo vigilante automático sigue
+    vivo y ver cuándo fue su última ejecución, sin tener que mirar logs.
+    """
     with lock_estado_vigilante:
         return {
             "intervalo_segundos": INTERVALO_VIGILANTE_SEGUNDOS,
-            "intervalo_reconciliacion_segundos": INTERVALO_RECONCILIACION_SEGUNDOS,
             "ultima_ejecucion": estado_vigilante_automatico["ultima_ejecucion"],
             "ultimo_resultado": estado_vigilante_automatico["ultimo_resultado"],
             "ejecuciones_desde_arranque": estado_vigilante_automatico["ejecuciones"],
@@ -1458,6 +1491,12 @@ def home():
                     .catch(error => console.error('Error al actualizar JSON:', error));
             }
 
+            // Refresco automático del contenido del JSON en pantalla.
+            // El vigilante corre en el servidor cada minuto y puede cambiar los
+            // datos (plazas nuevas, postulados actualizados, plazas
+            // vencidas eliminadas) sin que la página lo sepa. Este
+            // intervalo mantiene la vista sincronizada mientras esté abierta,
+            // sin necesidad de recargar manualmente.
             const INTERVALO_REFRESCO_MS = 30000; // 30 segundos
             setInterval(actualizarContenidoJSON, INTERVALO_REFRESCO_MS);
 
@@ -1670,6 +1709,9 @@ def home():
 
 @app.route("/limpiar-json", methods=["POST"])
 def limpiar_json():
+    """
+    Elimina el contenido del archivo JSON (reinicia la base de datos).
+    """
     try:
         if os.path.exists(ARCHIVO_DATOS):
             os.remove(ARCHIVO_DATOS)
@@ -1725,6 +1767,11 @@ def verjson():
 
 @app.route("/departamentos")
 def obtener_departamentos():
+    """
+    Devuelve la lista de departamentos con plazas:
+    - cantidad: plazas en el mapa
+    - en_json: plazas ya guardadas en el JSON para ese departamento
+    """
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(URL_PAGINA, headers=headers, timeout=30)
@@ -1774,11 +1821,7 @@ def obtener_departamentos():
 @app.route("/agregar-departamento", methods=["POST"])
 def agregar_departamento():
     """
-    Agrega todas las vacantes de un departamento al JSON, reconciliando
-    (elimina fantasmas que ya no aparezcan en este departamento), salvo que
-    el scrape haya traído sospechosamente pocas plazas frente a lo ya
-    guardado, en cuyo caso se hace un merge aditivo (ver
-    fusionar_departamento_con_salvaguarda).
+    Agrega todas las vacantes de un departamento al JSON.
     """
     try:
         data = request.get_json()
@@ -1796,9 +1839,7 @@ def agregar_departamento():
             return {"error": f"No se encontraron plazas para '{departamento_nombre}'."}, 404
 
         plazas_bd = cargar_datos_anteriores()
-        plazas_fusionadas, ids_nuevas, eliminadas, fue_sospechosa = fusionar_departamento_con_salvaguarda(
-            plazas_bd, plazas_departamento, departamento_nombre
-        )
+        plazas_fusionadas, ids_nuevas = fusionar_plazas(plazas_bd, plazas_departamento)
         guardar_datos_actuales(plazas_fusionadas)
 
         try:
@@ -1807,12 +1848,8 @@ def agregar_departamento():
         except Exception as e:
             print(f"Error al actualizar total_mapa: {e}")
 
-        mensaje = f"✅ Se procesaron {len(plazas_departamento)} plazas de '{departamento_nombre}'"
-        if fue_sospechosa:
-            mensaje += " (⚠️ caída sospechosa frente a lo guardado: no se eliminó nada, solo se agregó/actualizó)"
-
         return {
-            "mensaje": mensaje,
+            "mensaje": f"✅ Se procesaron {len(plazas_departamento)} plazas de '{departamento_nombre}'",
             "plazas_encontradas": len(plazas_departamento),
             "total_plazas_en_json": len(plazas_fusionadas),
             "plazas_nuevas": len(ids_nuevas),
@@ -1843,8 +1880,63 @@ def limpiar_vencidas():
 
 # Arranca al importar el módulo (no solo dentro de __main__) para que
 # también funcione cuando Render lo despliega con Gunicorn (gunicorn app:app).
+# ⚠️ Si usas más de 1 worker de Gunicorn, estos hilos arrancan UNA VEZ POR
+# WORKER y terminarás scrapeando / notificando el mismo departamento varias
+# veces en paralelo. Con Render, usa un solo worker
+# (gunicorn app:app --workers 1) o mueve esta tarea a un Background
+# Worker/Cron Job aparte.
 threading.Thread(target=hilo_actualizador_postulados, daemon=True).start()
 threading.Thread(target=hilo_vigilante_automatico, daemon=True).start()
+
+# ============================================================
+# CÓMO ACTIVAR EL COMANDO "Actualizar" (WEBHOOK DE TELEGRAM)
+# ============================================================
+# Telegram necesita saber a qué URL avisarte cada vez que alguien escribe en
+# el chat. Esto se configura UNA SOLA VEZ (no en cada arranque de la app),
+# llamando a la API de Telegram desde tu navegador, curl, o Postman -- o
+# simplemente visitando /set-webhook una vez desplegada la app:
+#
+#   https://<TU_APP>.onrender.com/set-webhook
+#
+# Opcional pero recomendado (evita que cualquiera golpee tu endpoint):
+# define la variable de entorno TELEGRAM_WEBHOOK_SECRET con un valor
+# aleatorio antes de desplegar.
+#
+# Para que el bot reaccione a "Actualizar" (sin "/") escrito en GRUPOS,
+# hay que desactivar su modo privado en @BotFather:
+#   /setprivacy -> selecciona el bot -> Disable
+# En chats privados 1 a 1 con el bot esto no es necesario.
+#
+# Para verificar que el webhook quedó bien configurado:
+#
+#   https://api.telegram.org/bot<TOKEN>/getWebhookInfo
+#
+# Una vez hecho esto, cualquier persona en el chat puede escribir
+# "Actualizar" (o "@VigilanteSistemaMaestroBot Actualizar" en un grupo, o
+# "/actualizar") y el bot ejecutará ejecutar_vigilante() y responderá en
+# ese mismo chat con el resumen de plazas.
+#
+# ============================================================
+# CHEQUEO AUTOMÁTICO CADA MINUTO (NUEVO)
+# ============================================================
+# Ya NO depende de un Cron Job externo de Render. El hilo
+# hilo_vigilante_automatico() corre dentro del propio proceso y llama a
+# ejecutar_vigilante() cada INTERVALO_VIGILANTE_SEGUNDOS (60s por defecto).
+# Puedes cambiar ese intervalo con la variable de entorno
+# INTERVALO_VIGILANTE_SEGUNDOS sin tocar el código.
+#
+# Para confirmar que sigue vivo, visita:
+#   https://<TU_APP>.onrender.com/status
+#
+# ⚠️ Si usas el plan gratuito de Render, el servicio se "duerme" tras un
+# rato sin recibir peticiones HTTP externas, y este hilo se detiene con él.
+# En ese caso sigue necesitando algo externo (p. ej. un ping gratuito de
+# UptimeRobot cada 5 min a la URL raíz "/") solo para mantener el proceso
+# despierto -- ya no hace falta que ese ping le pegue específicamente a
+# /check, porque el hilo interno se encarga de eso mientras el proceso
+# esté vivo. Si estás en un plan "always on", no necesitas ningún ping
+# externo.
+# ============================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
