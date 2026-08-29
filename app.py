@@ -874,12 +874,12 @@ def construir_resumen_completo(plazas_actuales, plazas_anteriores, total_mapa, c
     # Totales
     diferencia = total_mapa - total_mapa_anterior if total_mapa_anterior is not None else 0
     if diferencia > 0:
-        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>(+{diferencia})</b> ⬆️")
+        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_hoy} + {total_ayer} <b>(+{diferencia})</b> ⬆️")
     elif diferencia < 0:
-        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} <b>({diferencia})</b> ⬇️")
+        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_hoy} + {total_ayer} <b>({diferencia})</b> ⬇️")
     else:
-        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_mapa} ↔️")
-
+        lineas.append(f"🌎 <b>Total plazas activas:</b> {total_hoy} + {total_ayer} ↔️")
+    
     lineas.append(f"🆕 <b>Plazas de hoy:</b> {total_hoy}")
     lineas.append(f"📅 <b>Plazas de ayer:</b> {total_ayer}")
     lineas.append("")
